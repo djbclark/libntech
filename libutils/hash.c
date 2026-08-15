@@ -147,8 +147,14 @@ Hash *HashNew(const char *data, const unsigned int length, HashMethod method)
         Log(LOG_LEVEL_ERR, "Could not allocate openssl hash context");
         return NULL;
     }
+    if (EVP_DigestInit_ex(context, md, NULL) != 1)
+    {
+        Log(LOG_LEVEL_ERR, "Could not initialize openssl hash context");
+        EVP_MD_CTX_destroy(context);
+        return NULL;
+    }
+
     Hash *hash = HashBasicInit(method);
-    EVP_DigestInit_ex(context, md, NULL);
     EVP_DigestUpdate(context, data, (size_t) length);
     unsigned int digest_length;
     EVP_DigestFinal_ex(context, hash->digest, &digest_length);
@@ -398,7 +404,8 @@ HashSize HashSizeFromId(HashMethod hash_id)
 static void HashFile_Stream(
     FILE *const file,
     unsigned char digest[EVP_MAX_MD_SIZE + 1],
-    const HashMethod type)
+    const HashMethod type,
+    const char *const filename)
 {
     assert(file != NULL);
     const EVP_MD *const md = HashDigestFromId(type);
@@ -428,6 +435,12 @@ static void HashFile_Stream(
 
         unsigned int digest_length;
         EVP_DigestFinal(context, digest, &digest_length);
+    }
+    else
+    {
+        Log(LOG_LEVEL_ERR,
+            "Failed to initialize digest for hashing file '%s'",
+            filename);
     }
 
     EVP_MD_CTX_free(context);
@@ -467,7 +480,7 @@ void HashFile(
         return;
     }
 
-    HashFile_Stream(file, digest, type);
+    HashFile_Stream(file, digest, type, filename);
     fclose(file);
 }
 
@@ -582,6 +595,11 @@ void HashPubKey(
 
         unsigned int digest_length;
         EVP_DigestFinal(context, digest, &digest_length);
+    }
+    else
+    {
+        Log(LOG_LEVEL_ERR,
+            "Failed to initialize digest for hashing public key");
     }
 
     EVP_MD_CTX_free(context);
