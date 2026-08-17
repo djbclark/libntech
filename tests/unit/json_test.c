@@ -1406,6 +1406,31 @@ static void test_copy_preserves_numbers(void)
     CheckNumberSurvivesCopy("1e-8");
 }
 
+static void test_select_oversized_array_index(void)
+{
+    const char *data = "[1, 2, 3]";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+
+    // An all-digit index too large for a long cannot select anything. It
+    // used to reach StringToLongExitOnError() and terminate the process.
+    const char *huge[] = {"9223372036854775808"};
+    assert_true(JsonSelect(json, 1, (char **) huge) == NULL);
+
+    const char *huger[] = {"1000000000000000000000000000000"};
+    assert_true(JsonSelect(json, 1, (char **) huger) == NULL);
+
+    // Indices that do fit still behave as before
+    const char *first[] = {"0"};
+    assert_true(JsonSelect(json, 1, (char **) first) != NULL);
+
+    const char *past_end[] = {"3"};
+    assert_true(JsonSelect(json, 1, (char **) past_end) == NULL);
+
+    JsonDestroy(json);
+}
+
 static void test_parse_bad_numbers(void)
 {
     {
@@ -2778,6 +2803,7 @@ int main()
          * the tests that fail by assertion run first and say more. */
         unit_test(test_primitive_to_string_numbers),
         unit_test(test_copy_preserves_numbers),
+        unit_test(test_select_oversized_array_index),
     };
 
     return run_tests(tests);
