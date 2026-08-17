@@ -818,7 +818,12 @@ char *JsonPrimitiveToString(const JsonElement *const primitive)
         break;
 
     case JSON_PRIMITIVE_TYPE_REAL:
-        return StringFromDouble(JsonPrimitiveGetAsReal(primitive));
+        /* Return the number as it was parsed. Going through double and
+         * StringFromDouble() truncates to two decimals, so 0.00049 renders
+         * as "0.00" -- a wrong value, not a rounded one, and it reaches
+         * rendered configuration through mustache. It also disagrees with
+         * JsonWriteCompact(), which emits this same string unchanged. */
+        return xstrdup(JsonPrimitiveGetAsString(primitive));
         break;
 
     case JSON_PRIMITIVE_TYPE_STRING:

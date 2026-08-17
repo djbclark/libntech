@@ -395,11 +395,9 @@ static bool RenderVariablePrimitive(Buffer *out, const JsonElement *primitive, c
         return true;
 
     case JSON_PRIMITIVE_TYPE_REAL:
-        {
-            char *str = StringFromDouble(JsonPrimitiveGetAsReal(primitive));
-            BufferAppendString(out, str);
-            free(str);
-        }
+        /* Render the number as it was parsed rather than truncating it to
+         * two decimals. See JsonPrimitiveToString(). */
+        BufferAppendString(out, JsonPrimitiveGetAsString(primitive));
         return true;
 
     case JSON_PRIMITIVE_TYPE_BOOL:
