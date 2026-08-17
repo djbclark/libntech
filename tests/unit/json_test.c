@@ -1264,6 +1264,106 @@ static void test_parse_good_numbers(void)
     }
 }
 
+static void CheckNumberIsReal(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+
+    // The classification is checked before anything renders, so that a
+    // regression fails this assertion instead of exiting the test binary
+    assert_int_equal(JSON_PRIMITIVE_TYPE_REAL, JsonGetPrimitiveType(json));
+
+    // Rendering must return; it used to reach StringToLongExitOnError()
+    // and terminate the process when an exponent-notation number was
+    // classified as an integer. Since reals render from the text they were
+    // parsed from, the rendered form is the number as written.
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal(number, str);
+    free(str);
+
+    // Serialisation emits the number as it was parsed
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
+static void test_parse_exponent_numbers(void)
+{
+    // A number in exponent notation is a real, whether or not it also has
+    // a decimal point. These used to be classified as integers when no dot
+    // was seen, storing a lexeme strtol() cannot read, so rendering one
+    // terminated the process.
+    CheckNumberIsReal("1e-8");
+    CheckNumberIsReal("1E5");
+    CheckNumberIsReal("2e0");
+    CheckNumberIsReal("-2e-3");
+
+    // A number with both a dot and an exponent was a real all along;
+    // guard against regressing it
+    CheckNumberIsReal("1.5e3");
+}
+
+static void CheckIntegerRendersAsParsed(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(JSON_PRIMITIVE_TYPE_INTEGER, JsonGetPrimitiveType(json));
+
+    // JsonPrimitiveToString() returns the number as it was parsed ...
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal(number, str);
+    free(str);
+
+    // ... which is what JsonWriteCompact() emits for the same element
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
+static void test_primitive_to_string_numbers(void)
+{
+    // Integers that fit in a long render exactly as they always did
+    CheckIntegerRendersAsParsed("0");
+    CheckIntegerRendersAsParsed("42");
+    CheckIntegerRendersAsParsed("-42");
+    CheckIntegerRendersAsParsed("9223372036854775807"); // largest 64-bit long
+
+    // JSON puts no limit on the magnitude of a number. Converting these
+    // through long used to reach StringToLongExitOnError() and terminate
+    // the process; now they render as parsed.
+    CheckIntegerRendersAsParsed("9223372036854775808"); // one past it
+    CheckIntegerRendersAsParsed("-9223372036854775809");
+    CheckIntegerRendersAsParsed("1000000000000000000000000000000"); // 10^30
+
+    // Reals render as parsed, as the preceding change established. The
+    // exponent forms are the ones this change moves onto that path: before
+    // it they were classified as integers, and rendering one terminated
+    // the process.
+    CheckRealRendersAsParsed("0.5");
+    CheckRealRendersAsParsed("1e-8");
+    CheckRealRendersAsParsed("2e0");
+    CheckRealRendersAsParsed("1.5e3");
+
+    // A magnitude that overflows double. Converting through strtod() would
+    // return HUGE_VAL and "%.2f" would print "inf", which is not a JSON
+    // token; JsonWriteCompact() emits the lexeme, so rendering and
+    // serialising the same element would disagree.
+    CheckRealRendersAsParsed("1e400");
+    CheckRealRendersAsParsed("-1e400");
+}
+
 static void test_parse_bad_numbers(void)
 {
     {
@@ -2590,6 +2690,7 @@ int main()
         unit_test(test_parse_escaped_string),
         unit_test(test_parse_big_numbers),
         unit_test(test_parse_good_numbers),
+        unit_test(test_parse_exponent_numbers),
         unit_test(test_parse_object_compound),
         unit_test(test_parse_object_diverse),
         unit_test(test_parse_object_double_and_trailing_comma),
@@ -2628,6 +2729,12 @@ int main()
         unit_test(test_json_parse_object_missing_comma),
         unit_test(test_real_renders_as_parsed),
         unit_test(test_real_created_in_memory_renders_as_stored),
+
+        /* Tests whose subject is the conversion that exits the process are
+         * registered last. A regression in any of them terminates the whole
+         * binary at that point, so anything after them would report nothing;
+         * the tests that fail by assertion run first and say more. */
+        unit_test(test_primitive_to_string_numbers),
     };
 
     return run_tests(tests);
