@@ -92,6 +92,29 @@ static JsonElement *LoadTestFile(const char *filename)
     return json;
 }
 
+static void CheckRealRendersAsParsed(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(JSON_PRIMITIVE_TYPE_REAL, JsonGetPrimitiveType(json));
+
+    // JsonPrimitiveToString() returns the number as it was parsed ...
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal(number, str);
+    free(str);
+
+    // ... which is what JsonWriteCompact() emits for the same element
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
 static void test_new_delete(void)
 {
     JsonElement *json = JsonObjectCreate(10);
@@ -2487,6 +2510,49 @@ static void test_json_parse_object_missing_comma(void)
     }
 }
 
+static void test_real_renders_as_parsed(void)
+{
+    // Going through double and StringFromDouble() formatted with "%.2f",
+    // so anything with more than two decimals rendered as a wrong value
+    // rather than a rounded one.
+    CheckRealRendersAsParsed("0.00049");
+    CheckRealRendersAsParsed("3.14159265");
+    CheckRealRendersAsParsed("1234.1234");
+    CheckRealRendersAsParsed("-0.001");
+
+    // Two decimals or fewer were still reformatted: "0.5" came back "0.50",
+    // which disagrees with JsonWriteCompact() on the same element.
+    CheckRealRendersAsParsed("0.5");
+    CheckRealRendersAsParsed("0.25");
+
+    // Exponent forms are not covered here: a number written with an
+    // exponent and no decimal point is still classified as an integer at
+    // this point, so it does not reach this path yet.
+}
+
+static void test_real_created_in_memory_renders_as_stored(void)
+{
+    // Every case above starts from a parsed lexeme. A real built in memory
+    // renders from a different string: JsonRealCreate() stores its argument
+    // with "%.4f", so rendering must return that stored text rather than
+    // reformatting the value a second time. This used to render as "0.50",
+    // disagreeing with JsonWriteCompact() on the same element.
+    JsonElement *json = JsonRealCreate(0.5);
+    assert_int_equal(JSON_PRIMITIVE_TYPE_REAL, JsonGetPrimitiveType(json));
+
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal("0.5000", str);
+    free(str);
+
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal("0.5000", output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
 int main()
 {
     PRINT_TEST_BANNER();
@@ -2560,6 +2626,8 @@ int main()
         unit_test(test_compare_container_type_mismatch),
         unit_test(test_json_get_type_as_string),
         unit_test(test_json_parse_object_missing_comma),
+        unit_test(test_real_renders_as_parsed),
+        unit_test(test_real_created_in_memory_renders_as_stored),
     };
 
     return run_tests(tests);
