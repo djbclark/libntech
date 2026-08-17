@@ -248,13 +248,19 @@ static JsonElement *JsonPrimitiveCopy(const JsonElement *const primitive)
         return JsonBoolCreate(JsonPrimitiveGetAsBool(primitive));
 
     case JSON_PRIMITIVE_TYPE_INTEGER:
-        return JsonIntegerCreate(JsonPrimitiveGetAsInteger(primitive));
+    case JSON_PRIMITIVE_TYPE_REAL:
+        /* Copy the number as it was parsed. Rebuilding it from a C numeric
+         * type made a copy differ from its original in three ways:
+         * JsonIntegerCreate() takes an int, so a long was silently narrowed
+         * (LONG_MAX copied as -1); JsonRealCreate() formats with "%.4f", so
+         * 0.00049 copied as 0.0005; and JsonPrimitiveGetAsInteger() exits
+         * the process outright for a magnitude no long can hold. A copy must
+         * equal its original. */
+        return JsonElementCreatePrimitive(
+            type, xstrdup(primitive->primitive.value));
 
     case JSON_PRIMITIVE_TYPE_NULL:
         return JsonNullCreate();
-
-    case JSON_PRIMITIVE_TYPE_REAL:
-        return JsonRealCreate(JsonPrimitiveGetAsReal(primitive));
 
     case JSON_PRIMITIVE_TYPE_STRING:
         return JsonStringCreate(JsonPrimitiveGetAsString(primitive));
