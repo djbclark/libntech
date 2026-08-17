@@ -977,6 +977,134 @@ JsonElement *JsonObjectCreate(const size_t initialCapacity)
         JSON_CONTAINER_TYPE_OBJECT, NULL, initialCapacity);
 }
 
+/**
+  @brief Decode a single UTF-8 sequence.
+
+  Strictly validates the sequence: overlong encodings, encoded UTF-16
+  surrogates (U+D800..U+DFFF), code points beyond U+10FFFF, stray
+  continuation bytes and truncated sequences are all rejected.  Bytes are
+  checked one at a time, so a NUL terminator is never read past.
+
+  @param str [in] Start of the candidate UTF-8 sequence
+  @param codepoint [out] The decoded code point, only written on success
+  @return The number of bytes consumed (1 to 4), or 0 if @c str does not
+          start with a valid UTF-8 sequence
+ */
+static size_t Utf8DecodeCodePoint(
+    const char *const str, uint32_t *const codepoint)
+{
+    assert(str != NULL);
+    assert(codepoint != NULL);
+
+    const unsigned char *const s = (const unsigned char *) str;
+
+    if (s[0] < 0x80)
+    {
+        *codepoint = s[0];
+        return 1;
+    }
+
+    size_t length;
+    uint32_t value;
+    unsigned char second_min = 0x80;
+    unsigned char second_max = 0xbf;
+
+    if (s[0] >= 0xc2 && s[0] <= 0xdf)
+    {
+        length = 2;
+        value = s[0] & 0x1f;
+    }
+    else if (s[0] >= 0xe0 && s[0] <= 0xef)
+    {
+        length = 3;
+        value = s[0] & 0x0f;
+        if (s[0] == 0xe0)
+        {
+            second_min = 0xa0; // reject overlong encodings of U+0000..U+07FF
+        }
+        else if (s[0] == 0xed)
+        {
+            second_max = 0x9f; // reject encoded surrogates U+D800..U+DFFF
+        }
+    }
+    else if (s[0] >= 0xf0 && s[0] <= 0xf4)
+    {
+        length = 4;
+        value = s[0] & 0x07;
+        if (s[0] == 0xf0)
+        {
+            second_min = 0x90; // reject overlong encodings of U+0000..U+FFFF
+        }
+        else if (s[0] == 0xf4)
+        {
+            second_max = 0x8f; // reject code points beyond U+10FFFF
+        }
+    }
+    else
+    {
+        /* 0x80..0xc1: stray continuation byte, or lead byte of an overlong
+         * 2-byte sequence; 0xf5..0xff: lead byte of a sequence beyond
+         * U+10FFFF. */
+        return 0;
+    }
+
+    if (s[1] < second_min || s[1] > second_max)
+    {
+        return 0;
+    }
+    value = (value << 6) | (s[1] & 0x3f);
+
+    for (size_t i = 2; i < length; i++)
+    {
+        if (s[i] < 0x80 || s[i] > 0xbf)
+        {
+            return 0;
+        }
+        value = (value << 6) | (s[i] & 0x3f);
+    }
+
+    *codepoint = value;
+    return length;
+}
+
+/**
+  @brief Append the UTF-8 encoding of a Unicode code point to a writer.
+
+  @param codepoint [in] A Unicode scalar value, i.e. at most U+10FFFF and
+                        not a UTF-16 surrogate (U+D800..U+DFFF)
+  @param writer [in] The Writer to append to
+ */
+static void Utf8EncodeCodePointWriter(
+    const uint32_t codepoint, Writer *const writer)
+{
+    assert(writer != NULL);
+    assert(codepoint <= 0x10ffff);
+    assert(!(codepoint >= 0xd800 && codepoint <= 0xdfff));
+
+    if (codepoint < 0x80)
+    {
+        WriterWriteChar(writer, (char) codepoint);
+    }
+    else if (codepoint < 0x800)
+    {
+        WriterWriteChar(writer, (char) (0xc0 | (codepoint >> 6)));
+        WriterWriteChar(writer, (char) (0x80 | (codepoint & 0x3f)));
+    }
+    else if (codepoint < 0x10000)
+    {
+        WriterWriteChar(writer, (char) (0xe0 | (codepoint >> 12)));
+        WriterWriteChar(writer, (char) (0x80 | ((codepoint >> 6) & 0x3f)));
+        WriterWriteChar(writer, (char) (0x80 | (codepoint & 0x3f)));
+    }
+    else
+    {
+        WriterWriteChar(writer, (char) (0xf0 | (codepoint >> 18)));
+        WriterWriteChar(writer, (char) (0x80 | ((codepoint >> 12) & 0x3f)));
+        WriterWriteChar(writer, (char) (0x80 | ((codepoint >> 6) & 0x3f)));
+        WriterWriteChar(writer, (char) (0x80 | (codepoint & 0x3f)));
+    }
+}
+
 void JsonEncodeStringWriter(
     const char *const unescaped_string, Writer *const writer)
 {
@@ -1012,14 +1140,48 @@ void JsonEncodeStringWriter(
             WriterWriteChar(writer, 't');
             break;
         default:
+        {
             if (CharIsPrintableAscii(*c))
             {
                 WriterWriteChar(writer, *c);
+                break;
+            }
+
+            /* A \uXXXX escape denotes a Unicode code point, not a byte
+             * (RFC 8259 section 7), so decode the UTF-8 sequence and
+             * escape the code point it denotes.  The output stays pure
+             * ASCII, as it always has been. */
+            uint32_t codepoint;
+            const size_t length = Utf8DecodeCodePoint(c, &codepoint);
+            if (length == 0)
+            {
+                /* Not valid UTF-8.  JSON strings carry Unicode text, so
+                 * an arbitrary byte has no faithful representation;
+                 * escape the byte's value, which keeps the output valid
+                 * JSON and the value visible.  A conformant reader (ours
+                 * included) decodes this escape as U+00XX. */
+                WriterWriteF(writer, "\\u%04x", (unsigned char) *c);
+            }
+            else if (codepoint < 0x10000)
+            {
+                WriterWriteF(writer, "\\u%04x", (unsigned int) codepoint);
+                c += length - 1;
             }
             else
             {
-                WriterWriteF(writer, "\\u%04x", (unsigned char) *c);
+                /* Code points outside the Basic Multilingual Plane are
+                 * escaped as a UTF-16 surrogate pair (RFC 8259
+                 * section 7). */
+                const uint32_t reduced = codepoint - 0x10000;
+                WriterWriteF(
+                    writer,
+                    "\\u%04x\\u%04x",
+                    (unsigned int) (0xd800 + (reduced >> 10)),
+                    (unsigned int) (0xdc00 + (reduced & 0x3ff)));
+                c += length - 1;
             }
+            break;
+        }
         }
     }
 }
@@ -1033,39 +1195,46 @@ char *JsonEncodeString(const char *const unescaped_string)
     return StringWriterClose(writer);
 }
 
-static bool HexStringToChar(const char *hex_string, char *res)
+/**
+  @brief Parse exactly four hexadecimal digits, e.g. from a \uXXXX escape.
+
+  Bytes are checked one at a time, so a NUL terminator is never read past.
+
+  @param hex [in] String expected to start with four hexadecimal digits
+  @param value [out] The parsed value, only written on success
+  @return True if @c hex starts with four hexadecimal digits
+ */
+static bool FourHexDigitsToInt(const char *const hex, uint32_t *const value)
 {
-    assert(hex_string != NULL);
+    assert(hex != NULL);
+    assert(value != NULL);
 
-    const int hex_len = 4;
-    if (strlen(hex_string) < hex_len)
+    uint32_t result = 0;
+    for (int i = 0; i < 4; i++)
     {
-        return false;
-    }
-
-    char *tmp;
-    tmp = alloca(hex_len + 1);
-    memcpy(tmp, hex_string, hex_len);
-    tmp[hex_len] = '\0';
-
-    for (int i = 0; i < hex_len; ++i)
-    {
-        if (!isdigit(tmp[i]) &&
-          !(tmp[i] >= 'A' && tmp[i] <= 'F') &&
-          !(tmp[i] >= 'a' && tmp[i] <= 'f'))
+        const char digit = hex[i];
+        uint32_t nibble;
+        if (digit >= '0' && digit <= '9')
         {
+            nibble = digit - '0';
+        }
+        else if (digit >= 'a' && digit <= 'f')
+        {
+            nibble = digit - 'a' + 10;
+        }
+        else if (digit >= 'A' && digit <= 'F')
+        {
+            nibble = digit - 'A' + 10;
+        }
+        else
+        {
+            // not a hexadecimal digit (this also catches a NUL terminator)
             return false;
         }
+        result = (result << 4) | nibble;
     }
 
-    char *end;
-    long c = strtol(tmp, &end, 16);
-    if ((*end != '\0') || (c > 255) || (c < 0))
-    {
-        return false;
-    }
-
-    *res = (unsigned char) c;
+    *value = result;
     return true;
 }
 
@@ -1106,18 +1275,59 @@ static void JsonDecodeStringWriter(
                 c++;
                 break;
             case 'u':
-                if (c[2] == '\0')
+            {
+                uint32_t codepoint;
+                if (!FourHexDigitsToInt(c + 2, &codepoint))
                 {
+                    /* Not a valid JSON \u escape.  Substitute U+FFFD
+                     * REPLACEMENT CHARACTER for the "\u" introducer
+                     * rather than corrupting it into literal text;
+                     * whatever follows was never part of a valid escape
+                     * and is kept as-is. */
+                    Log(LOG_LEVEL_DEBUG,
+                        "Replacing malformed JSON \\u escape '%.6s' with U+FFFD",
+                        c);
+                    Utf8EncodeCodePointWriter(0xfffd, w);
+                    c += 1;
                     break;
                 }
 
-                char d;
-                if (HexStringToChar(c + 2, &d))
+                size_t consumed = 5; // "\uXXXX" minus the loop's increment
+                if (codepoint >= 0xd800 && codepoint <= 0xdbff)
                 {
-                    WriterWriteF(w, "%c", (unsigned char) d);
-                    c += 5;
+                    /* A high surrogate is only valid immediately followed
+                     * by a low surrogate escape; together they denote one
+                     * code point outside the Basic Multilingual Plane
+                     * (RFC 8259 section 7). */
+                    uint32_t low;
+                    if (c[6] == '\\' && c[7] == 'u' &&
+                        FourHexDigitsToInt(c + 8, &low) &&
+                        low >= 0xdc00 && low <= 0xdfff)
+                    {
+                        codepoint = 0x10000 + ((codepoint - 0xd800) << 10) +
+                                    (low - 0xdc00);
+                        consumed = 11; // "\uXXXX\uXXXX" minus the increment
+                    }
+                    else
+                    {
+                        Log(LOG_LEVEL_DEBUG,
+                            "Replacing unpaired JSON surrogate escape '%.6s' with U+FFFD",
+                            c);
+                        codepoint = 0xfffd;
+                    }
                 }
+                else if (codepoint >= 0xdc00 && codepoint <= 0xdfff)
+                {
+                    Log(LOG_LEVEL_DEBUG,
+                        "Replacing unpaired JSON surrogate escape '%.6s' with U+FFFD",
+                        c);
+                    codepoint = 0xfffd;
+                }
+
+                Utf8EncodeCodePointWriter(codepoint, w);
+                c += consumed;
                 break;
+            }
             default:
                 WriterWriteChar(w, *c);
                 break;
