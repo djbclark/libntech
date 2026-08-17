@@ -814,7 +814,12 @@ char *JsonPrimitiveToString(const JsonElement *const primitive)
         break;
 
     case JSON_PRIMITIVE_TYPE_INTEGER:
-        return StringFromLong(JsonPrimitiveGetAsInteger(primitive));
+        /* Return the number as it was parsed. Converting through long first
+         * is both lossy and fatal: JSON puts no limit on the magnitude of a
+         * number, so a document may legitimately hold one that does not fit,
+         * and JsonPrimitiveGetAsInteger() reaches
+         * StringToLongExitOnError() -> DoCleanupAndExit() on such a value. */
+        return xstrdup(JsonPrimitiveGetAsString(primitive));
         break;
 
     case JSON_PRIMITIVE_TYPE_REAL:
@@ -2377,7 +2382,11 @@ JsonParseError JsonParseAsNumber(
     // rewind 1 char so caller will see separator next
     *data = *data - 1;
 
-    if (seen_dot)
+    /* A number written in exponent notation is a real, whether or not it also
+     * has a fractional part. Classifying "1e-8" as an integer stores a lexeme
+     * that strtol() cannot read, and every later attempt to convert it goes
+     * through StringToLongExitOnError(), which terminates the process. */
+    if (seen_dot || seen_exponent)
     {
         *json_out = JsonElementCreatePrimitive(
             JSON_PRIMITIVE_TYPE_REAL, StringWriterClose(writer));
