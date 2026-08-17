@@ -1875,6 +1875,139 @@ static void test_string_escape(void)
     assert_json_strings_eq(unescaped_invalid_hex, escaped_invalid_hex);
 }
 
+#define assert_encodes_to(input, expected)         \
+    {                                              \
+        char *const out = JsonEncodeString(input); \
+        assert_string_equal(out, expected);        \
+        free(out);                                 \
+    }
+
+#define assert_decodes_to(input, expected)         \
+    {                                              \
+        char *const out = JsonDecodeString(input); \
+        assert_string_equal(out, expected);        \
+        free(out);                                 \
+    }
+
+/* The expectations below are hard-coded rather than round-tripped through
+ * libntech's own codec on purpose: the encoder and decoder used to be exact
+ * inverses of each other's non-conformance (CFE-4730), so a write-then-read
+ * test passed even on broken code.  Every expected value was derived from a
+ * known conformant implementation, e.g.:
+ *
+ *   $ python3 -c "import json; print(json.dumps('\u4e2d\u56fd'))"
+ *   "\u4e2d\u56fd"
+ *   $ python3 -c "print('\u4e2d\u56fd'.encode('utf-8').hex())"
+ *   e4b8ade59bbd
+ */
+static void test_string_encode_unicode(void)
+{
+    // U+4E2D U+56FD (Chinese "zhongguo"), UTF-8 e4 b8 ad e5 9b bd
+    assert_encodes_to("\xe4\xb8\xad\xe5\x9b\xbd", "\\u4e2d\\u56fd");
+
+    // U+00E9 (e with acute accent), UTF-8 c3 a9
+    assert_encodes_to("caf\xc3\xa9", "caf\\u00e9");
+
+    // U+1F600 (emoji), UTF-8 f0 9f 98 80: outside the Basic Multilingual
+    // Plane, escaped as a UTF-16 surrogate pair (RFC 8259 section 7)
+    assert_encodes_to("\xf0\x9f\x98\x80", "\\ud83d\\ude00");
+
+    // UTF-8 sequence length boundaries
+    assert_encodes_to("\x7f", "\\u007f");             // U+007F
+    assert_encodes_to("\xc2\x80", "\\u0080");         // U+0080
+    assert_encodes_to("\xdf\xbf", "\\u07ff");         // U+07FF
+    assert_encodes_to("\xe0\xa0\x80", "\\u0800");     // U+0800
+    assert_encodes_to("\xef\xbf\xbf", "\\uffff");     // U+FFFF
+    assert_encodes_to("\xf0\x90\x80\x80", "\\ud800\\udc00"); // U+10000
+    assert_encodes_to("\xf4\x8f\xbf\xbf", "\\udbff\\udfff"); // U+10FFFF
+
+    // the escapes JSON requires are unaffected
+    assert_encodes_to("say \"hi\"", "say \\\"hi\\\"");
+    assert_encodes_to("a\\b", "a\\\\b");
+    assert_encodes_to("\x01\x1f", "\\u0001\\u001f");
+
+    /* Input that is not valid UTF-8 has no faithful representation in a
+     * JSON string; each such byte is escaped by value.  Note that this
+     * makes the stray byte e9 and valid UTF-8 U+00E9 (c3 a9) encode to
+     * the same escape - inherent, since JSON strings carry Unicode code
+     * points, not bytes. */
+    assert_encodes_to("\x80", "\\u0080");         // stray continuation byte
+    assert_encodes_to("\xe9x", "\\u00e9x");       // lead byte, no continuation
+    assert_encodes_to("caf\xc3", "caf\\u00c3");   // truncated at end of string
+    assert_encodes_to("\xc0\xaf", "\\u00c0\\u00af"); // overlong encoding
+    // CESU-8 style encoded UTF-16 surrogate is not valid UTF-8 either:
+    assert_encodes_to("\xed\xa0\x80", "\\u00ed\\u00a0\\u0080");
+    assert_encodes_to("\xf5\x80", "\\u00f5\\u0080"); // beyond U+10FFFF
+}
+
+static void test_string_decode_unicode(void)
+{
+    // python3 -c "print('\u4e2d\u56fd'.encode('utf-8').hex())" -> e4b8ade59bbd
+    assert_decodes_to("\\u4e2d\\u56fd", "\xe4\xb8\xad\xe5\x9b\xbd");
+    assert_decodes_to("\\u4E2D", "\xe4\xb8\xad"); // upper-case hex digits
+    assert_decodes_to("caf\\u00e9", "caf\xc3\xa9");
+    assert_decodes_to("\\u0041", "A");
+
+    // surrogate pair -> U+1F600, UTF-8 f0 9f 98 80
+    assert_decodes_to("\\ud83d\\ude00", "\xf0\x9f\x98\x80");
+
+    // UTF-8 sequence length boundaries
+    assert_decodes_to("\\u007f", "\x7f");
+    assert_decodes_to("\\u0080", "\xc2\x80");
+    assert_decodes_to("\\u07ff", "\xdf\xbf");
+    assert_decodes_to("\\u0800", "\xe0\xa0\x80");
+    assert_decodes_to("\\uffff", "\xef\xbf\xbf");
+
+    /* An unpaired surrogate denotes no character; it becomes U+FFFD
+     * REPLACEMENT CHARACTER (UTF-8 ef bf bd) instead of being corrupted
+     * into literal text. */
+    assert_decodes_to("\\ud83d", "\xef\xbf\xbd");   // lone high surrogate
+    assert_decodes_to("\\ude00", "\xef\xbf\xbd");   // lone low surrogate
+    assert_decodes_to("a\\ud83dz", "a\xef\xbf\xbd" "z");
+    assert_decodes_to("\\ud83d\\u0041", "\xef\xbf\xbd" "A");
+    assert_decodes_to("\\ud800\\ud800", "\xef\xbf\xbd" "\xef\xbf\xbd");
+
+    /* A \u escape not followed by four hex digits is malformed JSON; the
+     * "\u" introducer becomes U+FFFD and the characters after it, which
+     * were never a valid escape, are kept as-is. */
+    assert_decodes_to("\\u", "\xef\xbf\xbd");
+    assert_decodes_to("ab\\u12", "ab\xef\xbf\xbd" "12");
+    assert_decodes_to("\\u12zz", "\xef\xbf\xbd" "12zz");
+
+    // ordinary escapes still work alongside \u escapes
+    assert_decodes_to("\\t\\u4e2d", "\t\xe4\xb8\xad");
+}
+
+static void test_parse_unicode_strings(void)
+{
+    {
+        // \uXXXX escapes in parsed documents must decode to UTF-8
+        const char *data =
+            "{\"city\": \"\\u4e2d\\u56fd\","
+            " \"cafe\": \"caf\\u00e9\","
+            " \"emoji\": \"\\ud83d\\ude00\"}";
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+        assert_string_equal(
+            JsonObjectGetAsString(json, "city"), "\xe4\xb8\xad\xe5\x9b\xbd");
+        assert_string_equal(
+            JsonObjectGetAsString(json, "cafe"), "caf\xc3\xa9");
+        assert_string_equal(
+            JsonObjectGetAsString(json, "emoji"), "\xf0\x9f\x98\x80");
+        JsonDestroy(json);
+    }
+
+    {
+        // raw UTF-8 in a parsed document passes through unmodified
+        const char *data = "{\"city\": \"\xe4\xb8\xad\xe5\x9b\xbd\"}";
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+        assert_string_equal(
+            JsonObjectGetAsString(json, "city"), "\xe4\xb8\xad\xe5\x9b\xbd");
+        JsonDestroy(json);
+    }
+}
+
 #define assert_json5_data_eq(_size, unescaped, escaped)           \
     {                                                             \
         Slice data = {.data = (void *) unescaped, .size = _size}; \
@@ -2554,6 +2687,9 @@ int main()
         unit_test(test_show_object_simple),
         unit_test(test_show_string),
         unit_test(test_string_escape),
+        unit_test(test_string_encode_unicode),
+        unit_test(test_string_decode_unicode),
+        unit_test(test_parse_unicode_strings),
         unit_test(test_string_escape_json5),
         unit_test(test_json_null_not_null),
         unit_test(test_json_object_merge_deep),
