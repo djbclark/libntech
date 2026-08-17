@@ -962,8 +962,15 @@ JsonElement *JsonSelect(
         case JSON_CONTAINER_TYPE_ARRAY:
             if (StringIsNumeric(index))
             {
-                size_t i = StringToLongExitOnError(index);
-                if (i < JsonLength(element))
+                /* An index too large for a long cannot select anything, so
+                 * treat it as absent rather than terminating the process --
+                 * the index may come from data. */
+                long i;
+                if (StringToLong(index, &i) != 0)
+                {
+                    return NULL;
+                }
+                if ((size_t) i < JsonLength(element))
                 {
                     JsonElement *child = JsonArrayGet(element, i);
                     if (child != NULL)
