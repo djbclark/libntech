@@ -1364,6 +1364,48 @@ static void test_primitive_to_string_numbers(void)
     CheckRealRendersAsParsed("-1e400");
 }
 
+static void CheckNumberSurvivesCopy(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+
+    JsonElement *copy = JsonCopy(json);
+    assert_true(copy != NULL);
+
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, copy);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(copy);
+    JsonDestroy(json);
+}
+
+static void test_copy_preserves_numbers(void)
+{
+    // A copy must equal its original. Rebuilding the number from a C
+    // numeric type did not: JsonIntegerCreate() takes an int, so a long
+    // was silently narrowed, and JsonRealCreate() formats with "%.4f".
+    CheckNumberSurvivesCopy("0");
+    CheckNumberSurvivesCopy("42");
+    CheckNumberSurvivesCopy("-42");
+
+    CheckNumberSurvivesCopy("2000000000000");       // copied as -1454759936
+    CheckNumberSurvivesCopy("9223372036854775807"); // copied as -1
+
+    // Magnitudes no long can hold used to terminate the process on copy
+    CheckNumberSurvivesCopy("9223372036854775808");
+    CheckNumberSurvivesCopy("1000000000000000000000000000000");
+
+    CheckNumberSurvivesCopy("0.5");        // copied as 0.5000
+    CheckNumberSurvivesCopy("0.00049");    // copied as 0.0005
+    CheckNumberSurvivesCopy("3.14159265"); // copied as 3.1416
+    CheckNumberSurvivesCopy("1e-8");
+}
+
 static void test_parse_bad_numbers(void)
 {
     {
@@ -2735,6 +2777,7 @@ int main()
          * binary at that point, so anything after them would report nothing;
          * the tests that fail by assertion run first and say more. */
         unit_test(test_primitive_to_string_numbers),
+        unit_test(test_copy_preserves_numbers),
     };
 
     return run_tests(tests);
