@@ -92,6 +92,29 @@ static JsonElement *LoadTestFile(const char *filename)
     return json;
 }
 
+static void CheckRealRendersAsParsed(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(JSON_PRIMITIVE_TYPE_REAL, JsonGetPrimitiveType(json));
+
+    // JsonPrimitiveToString() returns the number as it was parsed ...
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal(number, str);
+    free(str);
+
+    // ... which is what JsonWriteCompact() emits for the same element
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
 static void test_new_delete(void)
 {
     JsonElement *json = JsonObjectCreate(10);
@@ -1239,6 +1262,173 @@ static void test_parse_good_numbers(void)
         assert_true(json);
         JsonDestroy(json);
     }
+}
+
+static void CheckNumberIsReal(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+
+    // The classification is checked before anything renders, so that a
+    // regression fails this assertion instead of exiting the test binary
+    assert_int_equal(JSON_PRIMITIVE_TYPE_REAL, JsonGetPrimitiveType(json));
+
+    // Rendering must return; it used to reach StringToLongExitOnError()
+    // and terminate the process when an exponent-notation number was
+    // classified as an integer. Since reals render from the text they were
+    // parsed from, the rendered form is the number as written.
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal(number, str);
+    free(str);
+
+    // Serialisation emits the number as it was parsed
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
+static void test_parse_exponent_numbers(void)
+{
+    // A number in exponent notation is a real, whether or not it also has
+    // a decimal point. These used to be classified as integers when no dot
+    // was seen, storing a lexeme strtol() cannot read, so rendering one
+    // terminated the process.
+    CheckNumberIsReal("1e-8");
+    CheckNumberIsReal("1E5");
+    CheckNumberIsReal("2e0");
+    CheckNumberIsReal("-2e-3");
+
+    // A number with both a dot and an exponent was a real all along;
+    // guard against regressing it
+    CheckNumberIsReal("1.5e3");
+}
+
+static void CheckIntegerRendersAsParsed(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(JSON_PRIMITIVE_TYPE_INTEGER, JsonGetPrimitiveType(json));
+
+    // JsonPrimitiveToString() returns the number as it was parsed ...
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal(number, str);
+    free(str);
+
+    // ... which is what JsonWriteCompact() emits for the same element
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
+static void test_primitive_to_string_numbers(void)
+{
+    // Integers that fit in a long render exactly as they always did
+    CheckIntegerRendersAsParsed("0");
+    CheckIntegerRendersAsParsed("42");
+    CheckIntegerRendersAsParsed("-42");
+    CheckIntegerRendersAsParsed("9223372036854775807"); // largest 64-bit long
+
+    // JSON puts no limit on the magnitude of a number. Converting these
+    // through long used to reach StringToLongExitOnError() and terminate
+    // the process; now they render as parsed.
+    CheckIntegerRendersAsParsed("9223372036854775808"); // one past it
+    CheckIntegerRendersAsParsed("-9223372036854775809");
+    CheckIntegerRendersAsParsed("1000000000000000000000000000000"); // 10^30
+
+    // Reals render as parsed, as the preceding change established. The
+    // exponent forms are the ones this change moves onto that path: before
+    // it they were classified as integers, and rendering one terminated
+    // the process.
+    CheckRealRendersAsParsed("0.5");
+    CheckRealRendersAsParsed("1e-8");
+    CheckRealRendersAsParsed("2e0");
+    CheckRealRendersAsParsed("1.5e3");
+
+    // A magnitude that overflows double. Converting through strtod() would
+    // return HUGE_VAL and "%.2f" would print "inf", which is not a JSON
+    // token; JsonWriteCompact() emits the lexeme, so rendering and
+    // serialising the same element would disagree.
+    CheckRealRendersAsParsed("1e400");
+    CheckRealRendersAsParsed("-1e400");
+}
+
+static void CheckNumberSurvivesCopy(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+
+    JsonElement *copy = JsonCopy(json);
+    assert_true(copy != NULL);
+
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, copy);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(copy);
+    JsonDestroy(json);
+}
+
+static void test_copy_preserves_numbers(void)
+{
+    // A copy must equal its original. Rebuilding the number from a C
+    // numeric type did not: JsonIntegerCreate() takes an int, so a long
+    // was silently narrowed, and JsonRealCreate() formats with "%.4f".
+    CheckNumberSurvivesCopy("0");
+    CheckNumberSurvivesCopy("42");
+    CheckNumberSurvivesCopy("-42");
+
+    CheckNumberSurvivesCopy("2000000000000");       // copied as -1454759936
+    CheckNumberSurvivesCopy("9223372036854775807"); // copied as -1
+
+    // Magnitudes no long can hold used to terminate the process on copy
+    CheckNumberSurvivesCopy("9223372036854775808");
+    CheckNumberSurvivesCopy("1000000000000000000000000000000");
+
+    CheckNumberSurvivesCopy("0.5");        // copied as 0.5000
+    CheckNumberSurvivesCopy("0.00049");    // copied as 0.0005
+    CheckNumberSurvivesCopy("3.14159265"); // copied as 3.1416
+    CheckNumberSurvivesCopy("1e-8");
+}
+
+static void test_select_oversized_array_index(void)
+{
+    const char *data = "[1, 2, 3]";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+
+    // An all-digit index too large for a long cannot select anything. It
+    // used to reach StringToLongExitOnError() and terminate the process.
+    const char *huge[] = {"9223372036854775808"};
+    assert_true(JsonSelect(json, 1, (char **) huge) == NULL);
+
+    const char *huger[] = {"1000000000000000000000000000000"};
+    assert_true(JsonSelect(json, 1, (char **) huger) == NULL);
+
+    // Indices that do fit still behave as before
+    const char *first[] = {"0"};
+    assert_true(JsonSelect(json, 1, (char **) first) != NULL);
+
+    const char *past_end[] = {"3"};
+    assert_true(JsonSelect(json, 1, (char **) past_end) == NULL);
+
+    JsonDestroy(json);
 }
 
 static void test_parse_bad_numbers(void)
@@ -2487,6 +2677,49 @@ static void test_json_parse_object_missing_comma(void)
     }
 }
 
+static void test_real_renders_as_parsed(void)
+{
+    // Going through double and StringFromDouble() formatted with "%.2f",
+    // so anything with more than two decimals rendered as a wrong value
+    // rather than a rounded one.
+    CheckRealRendersAsParsed("0.00049");
+    CheckRealRendersAsParsed("3.14159265");
+    CheckRealRendersAsParsed("1234.1234");
+    CheckRealRendersAsParsed("-0.001");
+
+    // Two decimals or fewer were still reformatted: "0.5" came back "0.50",
+    // which disagrees with JsonWriteCompact() on the same element.
+    CheckRealRendersAsParsed("0.5");
+    CheckRealRendersAsParsed("0.25");
+
+    // Exponent forms are not covered here: a number written with an
+    // exponent and no decimal point is still classified as an integer at
+    // this point, so it does not reach this path yet.
+}
+
+static void test_real_created_in_memory_renders_as_stored(void)
+{
+    // Every case above starts from a parsed lexeme. A real built in memory
+    // renders from a different string: JsonRealCreate() stores its argument
+    // with "%.4f", so rendering must return that stored text rather than
+    // reformatting the value a second time. This used to render as "0.50",
+    // disagreeing with JsonWriteCompact() on the same element.
+    JsonElement *json = JsonRealCreate(0.5);
+    assert_int_equal(JSON_PRIMITIVE_TYPE_REAL, JsonGetPrimitiveType(json));
+
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal("0.5000", str);
+    free(str);
+
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal("0.5000", output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
 int main()
 {
     PRINT_TEST_BANNER();
@@ -2524,6 +2757,7 @@ int main()
         unit_test(test_parse_escaped_string),
         unit_test(test_parse_big_numbers),
         unit_test(test_parse_good_numbers),
+        unit_test(test_parse_exponent_numbers),
         unit_test(test_parse_object_compound),
         unit_test(test_parse_object_diverse),
         unit_test(test_parse_object_double_and_trailing_comma),
@@ -2560,6 +2794,16 @@ int main()
         unit_test(test_compare_container_type_mismatch),
         unit_test(test_json_get_type_as_string),
         unit_test(test_json_parse_object_missing_comma),
+        unit_test(test_real_renders_as_parsed),
+        unit_test(test_real_created_in_memory_renders_as_stored),
+
+        /* Tests whose subject is the conversion that exits the process are
+         * registered last. A regression in any of them terminates the whole
+         * binary at that point, so anything after them would report nothing;
+         * the tests that fail by assertion run first and say more. */
+        unit_test(test_primitive_to_string_numbers),
+        unit_test(test_copy_preserves_numbers),
+        unit_test(test_select_oversized_array_index),
     };
 
     return run_tests(tests);

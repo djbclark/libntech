@@ -248,13 +248,19 @@ static JsonElement *JsonPrimitiveCopy(const JsonElement *const primitive)
         return JsonBoolCreate(JsonPrimitiveGetAsBool(primitive));
 
     case JSON_PRIMITIVE_TYPE_INTEGER:
-        return JsonIntegerCreate(JsonPrimitiveGetAsInteger(primitive));
+    case JSON_PRIMITIVE_TYPE_REAL:
+        /* Copy the number as it was parsed. Rebuilding it from a C numeric
+         * type made a copy differ from its original in three ways:
+         * JsonIntegerCreate() takes an int, so a long was silently narrowed
+         * (LONG_MAX copied as -1); JsonRealCreate() formats with "%.4f", so
+         * 0.00049 copied as 0.0005; and JsonPrimitiveGetAsInteger() exits
+         * the process outright for a magnitude no long can hold. A copy must
+         * equal its original. */
+        return JsonElementCreatePrimitive(
+            type, xstrdup(primitive->primitive.value));
 
     case JSON_PRIMITIVE_TYPE_NULL:
         return JsonNullCreate();
-
-    case JSON_PRIMITIVE_TYPE_REAL:
-        return JsonRealCreate(JsonPrimitiveGetAsReal(primitive));
 
     case JSON_PRIMITIVE_TYPE_STRING:
         return JsonStringCreate(JsonPrimitiveGetAsString(primitive));
@@ -814,11 +820,21 @@ char *JsonPrimitiveToString(const JsonElement *const primitive)
         break;
 
     case JSON_PRIMITIVE_TYPE_INTEGER:
-        return StringFromLong(JsonPrimitiveGetAsInteger(primitive));
+        /* Return the number as it was parsed. Converting through long first
+         * is both lossy and fatal: JSON puts no limit on the magnitude of a
+         * number, so a document may legitimately hold one that does not fit,
+         * and JsonPrimitiveGetAsInteger() reaches
+         * StringToLongExitOnError() -> DoCleanupAndExit() on such a value. */
+        return xstrdup(JsonPrimitiveGetAsString(primitive));
         break;
 
     case JSON_PRIMITIVE_TYPE_REAL:
-        return StringFromDouble(JsonPrimitiveGetAsReal(primitive));
+        /* Return the number as it was parsed. Going through double and
+         * StringFromDouble() truncates to two decimals, so 0.00049 renders
+         * as "0.00" -- a wrong value, not a rounded one, and it reaches
+         * rendered configuration through mustache. It also disagrees with
+         * JsonWriteCompact(), which emits this same string unchanged. */
+        return xstrdup(JsonPrimitiveGetAsString(primitive));
         break;
 
     case JSON_PRIMITIVE_TYPE_STRING:
@@ -946,8 +962,15 @@ JsonElement *JsonSelect(
         case JSON_CONTAINER_TYPE_ARRAY:
             if (StringIsNumeric(index))
             {
-                size_t i = StringToLongExitOnError(index);
-                if (i < JsonLength(element))
+                /* An index too large for a long cannot select anything, so
+                 * treat it as absent rather than terminating the process --
+                 * the index may come from data. */
+                long i;
+                if (StringToLong(index, &i) != 0)
+                {
+                    return NULL;
+                }
+                if ((size_t) i < JsonLength(element))
                 {
                     JsonElement *child = JsonArrayGet(element, i);
                     if (child != NULL)
@@ -2372,7 +2395,11 @@ JsonParseError JsonParseAsNumber(
     // rewind 1 char so caller will see separator next
     *data = *data - 1;
 
-    if (seen_dot)
+    /* A number written in exponent notation is a real, whether or not it also
+     * has a fractional part. Classifying "1e-8" as an integer stores a lexeme
+     * that strtol() cannot read, and every later attempt to convert it goes
+     * through StringToLongExitOnError(), which terminates the process. */
+    if (seen_dot || seen_exponent)
     {
         *json_out = JsonElementCreatePrimitive(
             JSON_PRIMITIVE_TYPE_REAL, StringWriterClose(writer));
