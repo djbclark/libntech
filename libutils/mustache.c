@@ -71,25 +71,32 @@ static bool IsTagStandalone(const char *start, const char *tag_start, const char
     assert(start <= tag_start);
 
     *line_begin = start;
-    for (const char *cur = tag_start - 1; cur >= start; cur--)
+    // tag_start == start has no preceding character to scan; forming
+    // tag_start - 1 in that case would point before the buffer, which the
+    // loop below never would have dereferenced but is undefined behaviour
+    // to construct at all.
+    if (tag_start != start)
     {
-        if (IsSpace(*cur))
+        for (const char *cur = tag_start - 1; cur >= start; cur--)
         {
-            *line_begin = cur;
-            if (cur == start)
+            if (IsSpace(*cur))
             {
+                *line_begin = cur;
+                if (cur == start)
+                {
+                    break;
+                }
+                continue;
+            }
+            else if (*cur == '\n')
+            {
+                *line_begin = cur + 1;
                 break;
             }
-            continue;
-        }
-        else if (*cur == '\n')
-        {
-            *line_begin = cur + 1;
-            break;
-        }
-        else
-        {
-            return false;
+            else
+            {
+                return false;
+            }
         }
     }
 
@@ -274,7 +281,7 @@ static Mustache NextTag(const char *input,
         const char *escape_end = strstr(ret.content, extra_end);
         if (!escape_end || strncmp(escape_end + 1, delim_end, delim_end_len) != 0)
         {
-            Log(LOG_LEVEL_ERR, "Broken mustache template, couldn't find end tag for quoted begin tag at '%20s'...", input);
+            Log(LOG_LEVEL_ERR, "Broken mustache template, couldn't find end tag for quoted begin tag at '%.20s'...", input);
             ret.type = TAG_TYPE_ERR;
             return ret;
         }
@@ -287,7 +294,7 @@ static Mustache NextTag(const char *input,
         ret.end = strstr(ret.content, delim_end);
         if (!ret.end)
         {
-            Log(LOG_LEVEL_ERR, "Broken Mustache template, could not find end delimiter after reading start delimiter at '%20s'...", input);
+            Log(LOG_LEVEL_ERR, "Broken Mustache template, could not find end delimiter after reading start delimiter at '%.20s'...", input);
             ret.type = TAG_TYPE_ERR;
             return ret;
         }
