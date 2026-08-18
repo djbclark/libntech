@@ -2443,13 +2443,66 @@ static JsonParseError JsonParseAsString(
                 WriterWriteChar(writer, '\t');
                 continue;
 
+            case 'u':
+            {
+                // *data points at the 'u'; the hex digits follow it.
+                const char *const u = *data;
+                uint32_t codepoint;
+                if (!FourHexDigitsToInt(u + 1, &codepoint))
+                {
+                    /* Not a valid JSON \u escape.  Substitute U+FFFD
+                     * REPLACEMENT CHARACTER for the "\u" introducer
+                     * rather than corrupting it into literal text;
+                     * whatever follows was never part of a valid escape
+                     * and is kept as-is. */
+                    Log(LOG_LEVEL_DEBUG,
+                        "Replacing malformed JSON \\u escape '%.6s' with U+FFFD",
+                        u - 1); // Include the \ in the displayed escape
+                    Utf8EncodeCodePointWriter(0xfffd, writer);
+                    continue;
+                }
+
+                size_t consumed = 4; // the four hex digits after 'u'
+                if (codepoint >= 0xd800 && codepoint <= 0xdbff)
+                {
+                    /* A high surrogate is only valid immediately followed
+                     * by a low surrogate escape; together they denote one
+                     * code point outside the Basic Multilingual Plane
+                     * (RFC 8259 section 7). */
+                    uint32_t low;
+                    if (u[5] == '\\' && u[6] == 'u' &&
+                        FourHexDigitsToInt(u + 7, &low) &&
+                        low >= 0xdc00 && low <= 0xdfff)
+                    {
+                        codepoint = 0x10000 + ((codepoint - 0xd800) << 10) +
+                                    (low - 0xdc00);
+                        consumed = 10; // both \uXXXX\uXXXX hex runs
+                    }
+                    else
+                    {
+                        Log(LOG_LEVEL_DEBUG,
+                            "Replacing unpaired JSON surrogate escape '%.6s' with U+FFFD",
+                            u - 1);
+                        codepoint = 0xfffd;
+                    }
+                }
+                else if (codepoint >= 0xdc00 && codepoint <= 0xdfff)
+                {
+                    Log(LOG_LEVEL_DEBUG,
+                        "Replacing unpaired JSON surrogate escape '%.6s' with U+FFFD",
+                        u - 1);
+                    codepoint = 0xfffd;
+                }
+
+                Utf8EncodeCodePointWriter(codepoint, writer);
+                *data = *data + consumed;
+                continue;
+            }
+
             default:
-                /* Unrecognised escape sequence.
-                 *
-                 * For example, we fail to handle Unicode escapes -
-                 * \u{hex digits} - we have no way to represent the
-                 * character they denote.  So keep them verbatim, for
-                 * want of any other way to handle them; but warn. */
+                /* Unrecognised escape sequence: not one of the ones JSON
+                 * defines. Keep it verbatim, for want of any other way to
+                 * handle it; but warn. */
                 Log(LOG_LEVEL_DEBUG,
                     "Keeping verbatim unrecognised JSON escape '%.6s'",
                     *data - 1); // Include the \ in the displayed escape
@@ -2611,9 +2664,8 @@ static JsonParseError JsonParseAsPrimitive(
         {
             return err;
         }
-        *json_out = JsonElementCreatePrimitive(
-            JSON_PRIMITIVE_TYPE_STRING, JsonDecodeString(value));
-        free(value);
+        *json_out =
+            JsonElementCreatePrimitive(JSON_PRIMITIVE_TYPE_STRING, value);
         return JSON_PARSE_OK;
     }
     else
@@ -2685,9 +2737,7 @@ static JsonParseError JsonParseAsArray(
             }
             JsonArrayAppendElement(
                 array,
-                JsonElementCreatePrimitive(
-                    JSON_PRIMITIVE_TYPE_STRING, JsonDecodeString(value)));
-            free(value);
+                JsonElementCreatePrimitive(JSON_PRIMITIVE_TYPE_STRING, value));
         }
         break;
 
@@ -2874,9 +2924,7 @@ static JsonParseError JsonParseAsObject(
                     object,
                     property_name,
                     JsonElementCreatePrimitive(
-                        JSON_PRIMITIVE_TYPE_STRING,
-                        JsonDecodeString(property_value)));
-                free(property_value);
+                        JSON_PRIMITIVE_TYPE_STRING, property_value));
                 free(property_name);
                 property_name = NULL;
             }

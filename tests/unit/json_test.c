@@ -751,6 +751,71 @@ static void test_parse_object_escaped(void)
     JsonDestroy(obj);
 }
 
+/* CFE-4731: JsonParseAsString() and JsonDecodeString() used to both
+ * unescape backslash sequences, run one after the other over the same
+ * text. Any backslash JsonParseAsString() produced (from a \\ escape, or
+ * from a still-verbatim \uXXXX before that was folded in) was then
+ * re-interpreted as an escape introducer by JsonDecodeString(), silently
+ * corrupting any string containing an escaped backslash. These parse a
+ * full JSON document (unlike the JsonDecodeString()-only cases above) so
+ * they exercise the double-decode integration bug specifically. */
+static void test_parse_string_not_double_decoded(void)
+{
+    // A Windows path: the escaped backslashes must stay literal
+    // backslashes, not be re-decoded as \t and \n escape introducers.
+    {
+        const char *data = "{\"p\": \"C:\\\\temp\\\\new\"}";
+        JsonElement *obj = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+        assert_string_equal(JsonObjectGetAsString(obj, "p"), "C:\\temp\\new");
+        JsonDestroy(obj);
+    }
+
+    // An escaped backslash immediately followed by 'u0041' must stay as
+    // literal text, not be re-decoded as if it were the \u0041 escape.
+    {
+        const char *data = "{\"p\": \"\\\\u0041\"}";
+        JsonElement *obj = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+        assert_string_equal(JsonObjectGetAsString(obj, "p"), "\\u0041");
+        JsonDestroy(obj);
+    }
+
+    // An escaped backslash immediately followed by 't' must stay literal,
+    // not be re-decoded into a real tab character.
+    {
+        const char *data = "{\"p\": \"a\\\\tb\"}";
+        JsonElement *obj = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+        assert_string_equal(JsonObjectGetAsString(obj, "p"), "a\\tb");
+        JsonDestroy(obj);
+    }
+
+    // A genuine \u escape (single backslash) in a string VALUE must still
+    // decode correctly now that JsonParseAsString() owns \u handling.
+    {
+        const char *data = "{\"p\": \"caf\\u00e9\"}";
+        JsonElement *obj = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+        assert_string_equal(JsonObjectGetAsString(obj, "p"), "caf\xc3\xa9");
+        JsonDestroy(obj);
+    }
+}
+
+/* CFE-4731 side effect: object property NAMES go through
+ * JsonParseAsString() but were never passed to JsonDecodeString(), so a
+ * \u escape in a key was left as six literal characters instead of being
+ * decoded. Moving \u handling into JsonParseAsString() fixes this for
+ * free, since keys and values now share the same decoding path. */
+static void test_parse_object_key_unicode_escape(void)
+{
+    const char *data = "{\"\\u0041\": \"value\"}";
+    JsonElement *obj = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+    assert_string_equal(JsonObjectGetAsString(obj, "A"), "value");
+    JsonDestroy(obj);
+}
+
 static void test_parse_tzz_evil_key(void)
 {
     const char *data =
@@ -2655,6 +2720,8 @@ int main()
         unit_test(test_parse_empty_containers),
         unit_test(test_parse_empty_string),
         unit_test(test_parse_escaped_string),
+        unit_test(test_parse_string_not_double_decoded),
+        unit_test(test_parse_object_key_unicode_escape),
         unit_test(test_parse_big_numbers),
         unit_test(test_parse_good_numbers),
         unit_test(test_parse_object_compound),
