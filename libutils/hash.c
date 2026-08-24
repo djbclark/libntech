@@ -147,11 +147,23 @@ Hash *HashNew(const char *data, const unsigned int length, HashMethod method)
         Log(LOG_LEVEL_ERR, "Could not allocate openssl hash context");
         return NULL;
     }
+    if (EVP_DigestInit_ex(context, md, NULL) != 1)
+    {
+        Log(LOG_LEVEL_ERR, "Could not initialize openssl hash context");
+        EVP_MD_CTX_destroy(context);
+        return NULL;
+    }
+
     Hash *hash = HashBasicInit(method);
-    EVP_DigestInit_ex(context, md, NULL);
-    EVP_DigestUpdate(context, data, (size_t) length);
     unsigned int digest_length;
-    EVP_DigestFinal_ex(context, hash->digest, &digest_length);
+    if (EVP_DigestUpdate(context, data, (size_t) length) != 1
+        || EVP_DigestFinal_ex(context, hash->digest, &digest_length) != 1)
+    {
+        Log(LOG_LEVEL_ERR, "Could not compute openssl hash");
+        EVP_MD_CTX_destroy(context);
+        HashDestroy(&hash);
+        return NULL;
+    }
     EVP_MD_CTX_destroy(context);
     /* Update the printable representation */
     HashCalculatePrintableRepresentation(hash);
@@ -395,10 +407,11 @@ HashSize HashSizeFromId(HashMethod hash_id)
     return (hash_id >= HASH_METHOD_NONE) ? CF_NO_HASH : CF_DIGEST_SIZES[hash_id];
 }
 
-static void HashFile_Stream(
+static bool HashFile_Stream(
     FILE *const file,
     unsigned char digest[EVP_MAX_MD_SIZE + 1],
-    const HashMethod type)
+    const HashMethod type,
+    const char *const filename)
 {
     assert(file != NULL);
     const EVP_MD *const md = HashDigestFromId(type);
@@ -407,38 +420,73 @@ static void HashFile_Stream(
         Log(LOG_LEVEL_ERR,
             "Could not determine function for file hashing (type=%d)",
             (int) type);
-        return;
+        return false;
     }
 
     EVP_MD_CTX *const context = EVP_MD_CTX_new();
     if (context == NULL)
     {
         Log(LOG_LEVEL_ERR, "Failed to allocate openssl hashing context");
-        return;
+        return false;
     }
 
-    if (EVP_DigestInit(context, md) == 1)
+    bool success = false;
+    if (EVP_DigestInit(context, md) != 1)
     {
+        Log(LOG_LEVEL_ERR,
+            "Failed to initialize digest for hashing file '%s'",
+            filename);
+    }
+    else
+    {
+        success = true;
+
         unsigned char buffer[1024];
         size_t len;
-        while ((len = fread(buffer, 1, 1024, file)))
+        while ((len = fread(buffer, 1, sizeof(buffer), file)) > 0)
         {
-            EVP_DigestUpdate(context, buffer, len);
+            if (EVP_DigestUpdate(context, buffer, len) != 1)
+            {
+                Log(LOG_LEVEL_ERR,
+                    "Failed to hash contents of file '%s'",
+                    filename);
+                success = false;
+                break;
+            }
+        }
+
+        /* fread() returns 0 for both EOF and error, so without this a read
+         * failure part way through yields a well-formed digest of the bytes
+         * read before it. */
+        if (success && ferror(file))
+        {
+            Log(LOG_LEVEL_ERR,
+                "Failed to read file '%s' for hashing",
+                filename);
+            success = false;
         }
 
         unsigned int digest_length;
-        EVP_DigestFinal(context, digest, &digest_length);
+        if (success && EVP_DigestFinal(context, digest, &digest_length) != 1)
+        {
+            Log(LOG_LEVEL_ERR,
+                "Failed to finalize digest for hashing file '%s'",
+                filename);
+            success = false;
+        }
     }
 
     EVP_MD_CTX_free(context);
+    return success;
 }
 
 /**
  * @param text_mode whether to read the file in text mode or not (binary mode)
+ * @return whether the file was hashed; on failure digest is left all-zero
  * @note Reading/writing file in text mode on Windows changes Unix newlines
  *       into Windows newlines.
  */
-void HashFile(
+bool HashFile(
     const char *const filename,
     unsigned char digest[EVP_MAX_MD_SIZE + 1],
     HashMethod type,
@@ -464,11 +512,12 @@ void HashFile(
             "Cannot open file for hashing '%s'. (fopen: %s)",
             filename,
             GetErrorStr());
-        return;
+        return false;
     }
 
-    HashFile_Stream(file, digest, type);
+    const bool success = HashFile_Stream(file, digest, type, filename);
     fclose(file);
+    return success;
 }
 
 /*******************************************************************/
@@ -582,6 +631,11 @@ void HashPubKey(
 
         unsigned int digest_length;
         EVP_DigestFinal(context, digest, &digest_length);
+    }
+    else
+    {
+        Log(LOG_LEVEL_ERR,
+            "Failed to initialize digest for hashing public key");
     }
 
     EVP_MD_CTX_free(context);

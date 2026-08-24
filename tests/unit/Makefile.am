@@ -93,7 +93,8 @@ endif
 
 if WITH_OPENSSL
 check_PROGRAMS += \
-	hash_test
+	hash_test \
+	hash_init_fail_test
 endif
 
 TESTS = $(check_PROGRAMS)
@@ -145,6 +146,8 @@ logging_timestamp_test_SOURCES = logging_timestamp_test.c \
 	../../libutils/logging.h
 
 hash_test_SOURCES = hash_test.c
+
+hash_init_fail_test_SOURCES = hash_init_fail_test.c
 
 libcompat_test_CPPFLAGS = -I$(top_srcdir)/libcompat -I$(top_srcdir)/libutils
 libcompat_test_SOURCES = libcompat_test.c
