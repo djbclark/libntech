@@ -977,6 +977,68 @@ JsonElement *JsonObjectCreate(const size_t initialCapacity)
         JSON_CONTAINER_TYPE_OBJECT, NULL, initialCapacity);
 }
 
+/**
+  @brief Length of the valid multi-byte UTF-8 sequence at @c str.
+  @return 2 to 4, or 0 if @c str does not start with one.  Overlong forms,
+          UTF-16 surrogates and code points above U+10FFFF are rejected.
+ */
+static size_t Utf8SequenceLength(const char *const str)
+{
+    assert(str != NULL);
+
+    const unsigned char *const s = (const unsigned char *) str;
+    unsigned char second_min = 0x80;
+    unsigned char second_max = 0xbf;
+    size_t length;
+
+    if (s[0] >= 0xc2 && s[0] <= 0xdf)
+    {
+        length = 2;
+    }
+    else if (s[0] >= 0xe0 && s[0] <= 0xef)
+    {
+        length = 3;
+        if (s[0] == 0xe0)
+        {
+            second_min = 0xa0; // overlong
+        }
+        else if (s[0] == 0xed)
+        {
+            second_max = 0x9f; // U+D800..U+DFFF
+        }
+    }
+    else if (s[0] >= 0xf0 && s[0] <= 0xf4)
+    {
+        length = 4;
+        if (s[0] == 0xf0)
+        {
+            second_min = 0x90; // overlong
+        }
+        else if (s[0] == 0xf4)
+        {
+            second_max = 0x8f; // above U+10FFFF
+        }
+    }
+    else
+    {
+        return 0;
+    }
+
+    // Byte by byte, so a NUL (never a continuation byte) stops the scan
+    if (s[1] < second_min || s[1] > second_max)
+    {
+        return 0;
+    }
+    for (size_t i = 2; i < length; i++)
+    {
+        if (s[i] < 0x80 || s[i] > 0xbf)
+        {
+            return 0;
+        }
+    }
+    return length;
+}
+
 void JsonEncodeStringWriter(
     const char *const unescaped_string, Writer *const writer)
 {
@@ -1018,7 +1080,20 @@ void JsonEncodeStringWriter(
             }
             else
             {
-                WriterWriteF(writer, "\\u%04x", (unsigned char) *c);
+                const size_t length = Utf8SequenceLength(c);
+                if (length > 0)
+                {
+                    WriterWriteLen(writer, c, length);
+                    c += length - 1;
+                }
+                else
+                {
+                    /* Not UTF-8, so there is no code point to write.
+                     * Escaping the byte value keeps the output valid
+                     * JSON, and JsonDecodeString() turns it back into
+                     * the same byte. */
+                    WriterWriteF(writer, "\\u%04x", (unsigned char) *c);
+                }
             }
         }
     }
