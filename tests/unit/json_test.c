@@ -1875,6 +1875,45 @@ static void test_string_escape(void)
     assert_json_strings_eq(unescaped_invalid_hex, escaped_invalid_hex);
 }
 
+static void test_string_escape_utf8(void)
+{
+    // Valid UTF-8 is written as-is (RFC 8259 section 7)
+    assert_json_strings_eq("caf\xc3\xa9", "caf\xc3\xa9");
+    assert_json_strings_eq("\xe4\xb8\xad", "\xe4\xb8\xad");
+    assert_json_strings_eq("\xf0\x9f\x98\x80", "\xf0\x9f\x98\x80");
+
+    // Anything else is still escaped byte by byte: invalid, truncated,
+    // overlong, surrogate, beyond U+10FFFF, and control characters
+    assert_json_strings_eq("\xe9", "\\u00e9");
+    assert_json_strings_eq("\xe4\xb8" "x", "\\u00e4\\u00b8x");
+    assert_json_strings_eq("\xf0\x9f\x98", "\\u00f0\\u009f\\u0098");
+    assert_json_strings_eq("\xc0\xaf", "\\u00c0\\u00af");
+    assert_json_strings_eq("\xed\xa0\x80", "\\u00ed\\u00a0\\u0080");
+    assert_json_strings_eq(
+        "\xf4\x90\x80\x80", "\\u00f4\\u0090\\u0080\\u0080");
+    assert_json_strings_eq("\x01\x7f", "\\u0001\\u007f");
+
+    const char *const inputs[] = {
+        "caf\xc3\xa9",
+        "\xe4\xb8\xad \xf0\x9f\x98\x80",
+        "\xe9 \xe4\xb8 \xc0\xaf \xed\xa0\x80 \x01",
+    };
+    for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++)
+    {
+        JsonElement *const str = JsonStringCreate(inputs[i]);
+        char *const written = JsonToString(str);
+        JsonDestroy(str);
+
+        const char *data = written;
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+        assert_string_equal(inputs[i], JsonPrimitiveGetAsString(json));
+
+        JsonDestroy(json);
+        free(written);
+    }
+}
+
 #define assert_json5_data_eq(_size, unescaped, escaped)           \
     {                                                             \
         Slice data = {.data = (void *) unescaped, .size = _size}; \
@@ -2554,6 +2593,7 @@ int main()
         unit_test(test_show_object_simple),
         unit_test(test_show_string),
         unit_test(test_string_escape),
+        unit_test(test_string_escape_utf8),
         unit_test(test_string_escape_json5),
         unit_test(test_json_null_not_null),
         unit_test(test_json_object_merge_deep),
