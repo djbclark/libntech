@@ -61,6 +61,7 @@ check_PROGRAMS = \
 	xml_writer_test \
 	sequence_test \
 	json_test \
+	mustache_test \
 	misc_lib_test \
 	string_lib_test \
 	thread_test \
@@ -167,5 +168,7 @@ threaded_stack_test_SOURCES = threaded_stack_test.c
 file_lock_test_SOURCES = file_lock_test.c
 
 glob_lib_test_SOURCES = glob_lib_test.c
+
+mustache_test_SOURCES = mustache_test.c
 
 string_sequence_test_SOURCES = string_sequence_test.c
