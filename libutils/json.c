@@ -1127,7 +1127,6 @@ static void Utf8EncodeCodePointWriter(
         WriterWriteChar(writer, (char) (0x80 | (codepoint & 0x3f)));
     }
 }
-
 void JsonEncodeStringWriter(
     const char *const unescaped_string, Writer *const writer)
 {
@@ -1171,36 +1170,26 @@ void JsonEncodeStringWriter(
             }
 
             /* A \uXXXX escape denotes a Unicode code point, not a byte
-             * (RFC 8259 section 7), so decode the UTF-8 sequence and
-             * escape the code point it denotes.  The output stays pure
-             * ASCII, as it always has been. */
+             * (RFC 8259 section 7), so escaping each byte of a UTF-8
+             * sequence corrupts it ("café" read back as "cafÃ©").  Valid
+             * multi-byte UTF-8 is written as-is, which the RFC allows;
+             * control characters and bytes that are not valid UTF-8 are
+             * escaped. */
             uint32_t codepoint;
             const size_t length = Utf8DecodeCodePoint(c, &codepoint);
-            if (length == 0)
+            if (length <= 1)
             {
-                /* Not valid UTF-8.  JSON strings carry Unicode text, so
-                 * an arbitrary byte has no faithful representation;
-                 * escape the byte's value, which keeps the output valid
-                 * JSON and the value visible.  A conformant reader (ours
-                 * included) decodes this escape as U+00XX. */
+                /* A control character (the RFC requires the escape), or
+                 * not valid UTF-8.  JSON strings carry Unicode text, so an
+                 * arbitrary byte has no faithful representation; escape
+                 * the byte's value, which keeps the output valid JSON and
+                 * the value visible.  A conformant reader (ours included)
+                 * decodes this escape as U+00XX. */
                 WriterWriteF(writer, "\\u%04x", (unsigned char) *c);
-            }
-            else if (codepoint < 0x10000)
-            {
-                WriterWriteF(writer, "\\u%04x", (unsigned int) codepoint);
-                c += length - 1;
             }
             else
             {
-                /* Code points outside the Basic Multilingual Plane are
-                 * escaped as a UTF-16 surrogate pair (RFC 8259
-                 * section 7). */
-                const uint32_t reduced = codepoint - 0x10000;
-                WriterWriteF(
-                    writer,
-                    "\\u%04x\\u%04x",
-                    (unsigned int) (0xd800 + (reduced >> 10)),
-                    (unsigned int) (0xdc00 + (reduced & 0x3ff)));
+                WriterWriteLen(writer, c, length);
                 c += length - 1;
             }
             break;

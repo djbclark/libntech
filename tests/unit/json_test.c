@@ -2157,24 +2157,29 @@ static void test_string_escape(void)
  */
 static void test_string_encode_unicode(void)
 {
+    /* Valid UTF-8 is written as-is (RFC 8259 section 7 allows it; the
+     * fix/json-encode-raw-utf8 branch chose it over code-point escapes so
+     * other parsers read "café" and not "cafÃ©").  See also
+     * test_string_escape_utf8(). */
     // U+4E2D U+56FD (Chinese "zhongguo"), UTF-8 e4 b8 ad e5 9b bd
-    assert_encodes_to("\xe4\xb8\xad\xe5\x9b\xbd", "\\u4e2d\\u56fd");
+    assert_encodes_to("\xe4\xb8\xad\xe5\x9b\xbd", "\xe4\xb8\xad\xe5\x9b\xbd");
 
     // U+00E9 (e with acute accent), UTF-8 c3 a9
-    assert_encodes_to("caf\xc3\xa9", "caf\\u00e9");
+    assert_encodes_to("caf\xc3\xa9", "caf\xc3\xa9");
 
     // U+1F600 (emoji), UTF-8 f0 9f 98 80: outside the Basic Multilingual
-    // Plane, escaped as a UTF-16 surrogate pair (RFC 8259 section 7)
-    assert_encodes_to("\xf0\x9f\x98\x80", "\\ud83d\\ude00");
+    // Plane, still written as-is
+    assert_encodes_to("\xf0\x9f\x98\x80", "\xf0\x9f\x98\x80");
 
-    // UTF-8 sequence length boundaries
-    assert_encodes_to("\x7f", "\\u007f");             // U+007F
-    assert_encodes_to("\xc2\x80", "\\u0080");         // U+0080
-    assert_encodes_to("\xdf\xbf", "\\u07ff");         // U+07FF
-    assert_encodes_to("\xe0\xa0\x80", "\\u0800");     // U+0800
-    assert_encodes_to("\xef\xbf\xbf", "\\uffff");     // U+FFFF
-    assert_encodes_to("\xf0\x90\x80\x80", "\\ud800\\udc00"); // U+10000
-    assert_encodes_to("\xf4\x8f\xbf\xbf", "\\udbff\\udfff"); // U+10FFFF
+    // UTF-8 sequence length boundaries: DEL is not printable ASCII and is
+    // escaped; every valid multi-byte sequence passes through
+    assert_encodes_to("\x7f", "\\u007f");                     // U+007F
+    assert_encodes_to("\xc2\x80", "\xc2\x80");                 // U+0080
+    assert_encodes_to("\xdf\xbf", "\xdf\xbf");                 // U+07FF
+    assert_encodes_to("\xe0\xa0\x80", "\xe0\xa0\x80");         // U+0800
+    assert_encodes_to("\xef\xbf\xbf", "\xef\xbf\xbf");         // U+FFFF
+    assert_encodes_to("\xf0\x90\x80\x80", "\xf0\x90\x80\x80"); // U+10000
+    assert_encodes_to("\xf4\x8f\xbf\xbf", "\xf4\x8f\xbf\xbf"); // U+10FFFF
 
     // the escapes JSON requires are unaffected
     assert_encodes_to("say \"hi\"", "say \\\"hi\\\"");
@@ -2182,10 +2187,9 @@ static void test_string_encode_unicode(void)
     assert_encodes_to("\x01\x1f", "\\u0001\\u001f");
 
     /* Input that is not valid UTF-8 has no faithful representation in a
-     * JSON string; each such byte is escaped by value.  Note that this
-     * makes the stray byte e9 and valid UTF-8 U+00E9 (c3 a9) encode to
-     * the same escape - inherent, since JSON strings carry Unicode code
-     * points, not bytes. */
+     * JSON string; each such byte is escaped by value.  A conformant
+     * reader decodes \u00e9 as U+00E9 (c3 a9), not as the byte e9 -
+     * inherent, since JSON strings carry Unicode code points, not bytes. */
     assert_encodes_to("\x80", "\\u0080");         // stray continuation byte
     assert_encodes_to("\xe9x", "\\u00e9x");       // lead byte, no continuation
     assert_encodes_to("caf\xc3", "caf\\u00c3");   // truncated at end of string
@@ -2260,6 +2264,54 @@ static void test_parse_unicode_strings(void)
         assert_string_equal(
             JsonObjectGetAsString(json, "city"), "\xe4\xb8\xad\xe5\x9b\xbd");
         JsonDestroy(json);
+    }
+}
+
+static void test_string_escape_utf8(void)
+{
+    // Valid UTF-8 is written as-is (RFC 8259 section 7)
+    assert_json_strings_eq("caf\xc3\xa9", "caf\xc3\xa9");
+    assert_json_strings_eq("\xe4\xb8\xad", "\xe4\xb8\xad");
+    assert_json_strings_eq("\xf0\x9f\x98\x80", "\xf0\x9f\x98\x80");
+
+    /* Anything else is still escaped byte by byte: invalid, truncated,
+     * overlong, surrogate, beyond U+10FFFF, and control characters.  Encode
+     * only: the conformant decoder (CFE-4730) reads \u00XX as U+00XX, not as
+     * the byte 0xXX, so these do not round-trip (see below). */
+    assert_encodes_to("\xe9", "\\u00e9");
+    assert_encodes_to("\xe4\xb8" "x", "\\u00e4\\u00b8x");
+    assert_encodes_to("\xf0\x9f\x98", "\\u00f0\\u009f\\u0098");
+    assert_encodes_to("\xc0\xaf", "\\u00c0\\u00af");
+    assert_encodes_to("\xed\xa0\x80", "\\u00ed\\u00a0\\u0080");
+    assert_encodes_to("\xf4\x90\x80\x80", "\\u00f4\\u0090\\u0080\\u0080");
+    assert_json_strings_eq("\x01\x7f", "\\u0001\\u007f");
+
+    /* Valid UTF-8 round-trips unchanged.  Bytes that are not valid UTF-8
+     * do not: \u00e9 denotes U+00E9, so the conformant decoder (CFE-4730)
+     * reads it back as c3 a9, not as the byte e9 it was written for. */
+    const char *const inputs[] = {
+        "caf\xc3\xa9",
+        "\xe4\xb8\xad \xf0\x9f\x98\x80",
+        "\xe9 \xe4\xb8 \xc0\xaf \xed\xa0\x80 \x01",
+    };
+    const char *const expected[] = {
+        "caf\xc3\xa9",
+        "\xe4\xb8\xad \xf0\x9f\x98\x80",
+        "\xc3\xa9 \xc3\xa4\xc2\xb8 \xc3\x80\xc2\xaf \xc3\xad\xc2\xa0\xc2\x80 \x01",
+    };
+    for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++)
+    {
+        JsonElement *const str = JsonStringCreate(inputs[i]);
+        char *const written = JsonToString(str);
+        JsonDestroy(str);
+
+        const char *data = written;
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+        assert_string_equal(expected[i], JsonPrimitiveGetAsString(json));
+
+        JsonDestroy(json);
+        free(written);
     }
 }
 
@@ -2991,6 +3043,7 @@ int main()
         unit_test(test_string_encode_unicode),
         unit_test(test_string_decode_unicode),
         unit_test(test_parse_unicode_strings),
+        unit_test(test_string_escape_utf8),
         unit_test(test_string_escape_json5),
         unit_test(test_json_null_not_null),
         unit_test(test_json_object_merge_deep),
