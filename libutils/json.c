@@ -3076,8 +3076,17 @@ JsonParseError JsonParseFileStrict(
     assert(json_out != NULL);
     *json_out = NULL;
 
+    const int fd = safe_open(path, O_RDONLY);
+    if (fd == -1)
+    {
+        return JSON_PARSE_ERROR_NO_SUCH_FILE;
+    }
+
     bool truncated = false;
-    Writer *contents = FileRead(path, size_max, &truncated);
+    Writer *const contents = FileReadFromFd(fd, size_max, &truncated);
+    struct stat sb;
+    const bool have_size = (fstat(fd, &sb) == 0);
+    close(fd);
     if (contents == NULL)
     {
         return JSON_PARSE_ERROR_NO_SUCH_FILE;
@@ -3090,10 +3099,12 @@ JsonParseError JsonParseFileStrict(
 
     const char *data = StringWriterData(contents);
     JsonParseError error;
-    if (strlen(data) != StringWriterLength(contents))
+    if (!have_size || (size_t) sb.st_size != StringWriterLength(contents))
     {
-        /* A null byte would end the string early and hide the rest of
-         * the file from the parser. */
+        /* The Writer is a C string: a null byte ends it early and hides
+         * the rest of the file from the parser, so fewer bytes arrive than
+         * the file holds. A file that changed while it was read is refused
+         * too. */
         error = JSON_PARSE_ERROR_INVALID_END;
     }
     else
