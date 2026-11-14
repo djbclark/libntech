@@ -118,6 +118,7 @@ typedef enum
     JSON_PARSE_ERROR_NO_SUCH_FILE,
     JSON_PARSE_ERROR_NO_DATA,
     JSON_PARSE_ERROR_TRUNCATED,
+    JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY,
 
     JSON_PARSE_ERROR_MAX
 } JsonParseError;
@@ -605,6 +606,22 @@ JsonParseError JsonParse(const char **data, JsonElement **json_out);
 JsonParseError JsonParseAll(const char **data, JsonElement **json_out);
 
 /**
+  @brief Parse the whole string, refusing input a lenient parse would repair
+  @param data [in] Pointer to the string to parse
+  @param json_out Resulting JSON object, NULL on error
+  @note In contrast to JsonParse() and JsonParseAll(), a document with two
+        members of the same name in one object, at any depth, is refused
+        with JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY before the earlier
+        member is replaced, rather than silently keeping the last one.
+        As in JsonParseAll(), trailing non-whitespace characters are refused
+        with JSON_PARSE_ERROR_INVALID_END. Names are compared as the parser
+        decodes them, which is the comparison JsonObjectGet() makes, so no
+        member is ever replaced.
+  @returns See JsonParseError and JsonParseErrorToString
+  */
+JsonParseError JsonParseStrict(const char **data, JsonElement **json_out);
+
+/**
   @brief Parse a string to create a JsonElement
   @param lookup_data [in] Evaluation context for variable lookups
   @param lookup_function [in] Callback function for variable lookups
@@ -643,6 +660,19 @@ JsonParseError JsonParseAnyFile(
  * @return See JsonParseError and JsonParseErrorToString
  */
 JsonParseError JsonParseFile(
+    const char *path, size_t size_max, JsonElement **json_out);
+
+/**
+ * @brief Parse JSON from a file as JsonParseStrict() parses a string.
+ * @param path Path to the file
+ * @param size_max Maximum size to read in memory; a larger file is refused
+ *        with JSON_PARSE_ERROR_TRUNCATED, as in JsonParseFile()
+ * @param json_out Resulting JSON object, NULL on error
+ * @note A null byte in the file is refused with JSON_PARSE_ERROR_INVALID_END,
+ *       as it would otherwise end the text early and hide what follows.
+ * @return See JsonParseError and JsonParseErrorToString
+ */
+JsonParseError JsonParseFileStrict(
     const char *path, size_t size_max, JsonElement **json_out);
 
 const char *JsonParseErrorToString(JsonParseError error);
