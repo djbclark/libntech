@@ -9,6 +9,11 @@
 #include <alloc.h>    // xasprintf()
 
 #include <float.h>
+#ifndef __MINGW32__
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#endif
 
 
 static const char *OBJECT_ARRAY =
@@ -2782,6 +2787,37 @@ static void assert_healthy_json_file_accepted(
     unlink(filename);
 }
 
+#ifndef __MINGW32__
+static JsonParseError parse_fifo_file(
+    const char *const fifo_path,
+    const char *const content,
+    const size_t length,
+    const size_t size_max,
+    JsonElement **const json_out)
+{
+    const pid_t pid = fork();
+    assert_true(pid >= 0);
+    if (pid == 0)
+    {
+        signal(SIGPIPE, SIG_IGN);
+        const int wfd = open(fifo_path, O_WRONLY);
+        if (wfd >= 0)
+        {
+            (void) FullWrite(wfd, content, length);
+            close(wfd);
+        }
+        _exit(0);
+    }
+
+    const JsonParseError err = JsonParseFile(fifo_path, size_max, json_out);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    {
+    }
+    return err;
+}
+#endif
+
 static void test_parse_file_raw_nul_boundaries(void)
 {
     /* Trailing-NUL-only: {}\0 (7b 7d 00) and {}\n\0 (7b 7d 0a 00). */
@@ -2791,6 +2827,13 @@ static void test_parse_file_raw_nul_boundaries(void)
     assert_raw_nul_file_refused(
         trailing_lf_nul, sizeof(trailing_lf_nul), 1024);
 
+    /* Exact file_size == size_max with trailing NUL must still refuse. */
+    assert_raw_nul_file_refused(
+        trailing_nul, sizeof(trailing_nul), sizeof(trailing_nul));
+    assert_raw_nul_file_refused(
+        trailing_lf_nul, sizeof(trailing_lf_nul), sizeof(trailing_lf_nul));
+    assert_healthy_json_file_accepted("{}", 2, 2);
+
     /* Leading-NUL: \0{} (00 7b 7d) must give INVALID_END, not NO_DATA. */
     static const char leading_nul[] = { '\0', '{', '}' };
     assert_raw_nul_file_refused(leading_nul, sizeof(leading_nul), 1024);
@@ -2798,6 +2841,52 @@ static void test_parse_file_raw_nul_boundaries(void)
     /* Mid-file NUL hiding trailing garbage. */
     static const char mid_nul[] = "{\"vars\": {}}\0not-json";
     assert_raw_nul_file_refused(mid_nul, sizeof(mid_nul) - 1, 1024);
+
+    /* YAML raw-NUL refusal via JsonParseAnyFile(..., true) and
+     * JsonReadDataFile(..., DATAFILETYPE_YAML, ...), independent of libyaml
+     * because NUL detection runs during reading before parsing. */
+    char yaml_file[] = "/tmp/json_test_yaml_nul_XXXXXX";
+    static const char yaml_nul[] = "a: 1\n\0b: 2\n";
+    write_strict_test_file(yaml_file, yaml_nul, sizeof(yaml_nul) - 1);
+    JsonElement *yaml_json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        JsonParseAnyFile(yaml_file, 1024, &yaml_json, true));
+    assert_true(yaml_json == NULL);
+    yaml_json = JsonReadDataFile(
+        "json_test", yaml_file, DATAFILETYPE_YAML, 1024, false);
+    assert_true(yaml_json == NULL);
+    unlink(yaml_file);
+
+#ifndef __MINGW32__
+    /* Non-regular file (FIFO / named pipe): raw NUL refused, valid JSON ok. */
+    char fifo_dir[] = "/tmp/json_test_fifo_XXXXXX";
+    assert_true(mkdtemp(fifo_dir) != NULL);
+    char fifo_path[128];
+    xsnprintf(fifo_path, sizeof(fifo_path), "%s/in.fifo", fifo_dir);
+    assert_int_equal(0, mkfifo(fifo_path, 0600));
+
+    static const char fifo_nul[] = "{\"ok\":true}\0garbage";
+    JsonElement *fifo_json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        parse_fifo_file(
+            fifo_path, fifo_nul, sizeof(fifo_nul) - 1, 1024, &fifo_json));
+    assert_true(fifo_json == NULL);
+
+    static const char fifo_ok[] = "{\"ok\":true}";
+    fifo_json = NULL;
+    assert_int_equal(
+        JSON_PARSE_OK,
+        parse_fifo_file(
+            fifo_path, fifo_ok, sizeof(fifo_ok) - 1, 1024, &fifo_json));
+    assert_true(fifo_json != NULL);
+    assert_true(JsonObjectGetAsBool(fifo_json, "ok"));
+    JsonDestroy(fifo_json);
+
+    unlink(fifo_path);
+    rmdir(fifo_dir);
+#endif
 
     /* Chunk-boundary NUL: valid JSON padded past READ_BUFSIZE (> 8192 bytes)
      * with a single 0x00 as its final byte. */

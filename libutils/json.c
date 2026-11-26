@@ -3700,6 +3700,60 @@ JsonParseError JsonParseStrict(
     return JSON_PARSE_OK;
 }
 
+static JsonParseError JsonReadFileNoNul(
+    const int fd,
+    const size_t size_max,
+    Writer **const contents_out,
+    size_t *const bytes_read_out)
+{
+    assert(contents_out != NULL);
+    *contents_out = NULL;
+    if (bytes_read_out != NULL)
+    {
+        *bytes_read_out = 0;
+    }
+
+    Writer *const w = StringWriter();
+    size_t total_read = 0;
+
+    for (;;)
+    {
+        char buf[4096];
+        const ssize_t n = read(fd, buf, sizeof(buf));
+        if (n == 0)
+        {
+            *contents_out = w;
+            if (bytes_read_out != NULL)
+            {
+                *bytes_read_out = total_read;
+            }
+            return JSON_PARSE_OK;
+        }
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            WriterClose(w);
+            return JSON_PARSE_ERROR_NO_SUCH_FILE;
+        }
+        const size_t chunk = (size_t) n;
+        if (memchr(buf, '\0', chunk) != NULL)
+        {
+            WriterClose(w);
+            return JSON_PARSE_ERROR_INVALID_END;
+        }
+        if (chunk > size_max - total_read)
+        {
+            WriterClose(w);
+            return JSON_PARSE_ERROR_TRUNCATED;
+        }
+        WriterWriteLen(w, buf, chunk);
+        total_read += chunk;
+    }
+}
+
 JsonParseError JsonParseAnyFile(
     const char *const path,
     const size_t size_max,
@@ -3715,36 +3769,18 @@ JsonParseError JsonParseAnyFile(
         return JSON_PARSE_ERROR_NO_SUCH_FILE;
     }
 
-    bool truncated = false;
-    Writer *const contents = FileReadFromFd(fd, size_max, &truncated);
-    struct stat sb;
-    const bool have_size = (fstat(fd, &sb) == 0);
+    Writer *contents = NULL;
+    JsonParseError err = JsonReadFileNoNul(fd, size_max, &contents, NULL);
     close(fd);
-    if (contents == NULL)
+    if (err != JSON_PARSE_OK)
     {
-        return JSON_PARSE_ERROR_NO_SUCH_FILE;
-    }
-    if (truncated)
-    {
-        WriterClose(contents);
-        return JSON_PARSE_ERROR_TRUNCATED;
+        return err;
     }
 
     const char *data = StringWriterData(contents);
-    JsonParseError err;
-
     if (yaml_format)
     {
         err = JsonParseYamlString(&data, json_out);
-    }
-    else if (have_size && S_ISREG(sb.st_mode)
-             && (sb.st_size < 0
-                 || (size_t) sb.st_size != StringWriterLength(contents)))
-    {
-        /* The Writer is a C string: a null byte truncates a read chunk
-         * early and hides the rest of the file from the parser, so fewer
-         * bytes arrive than the file holds. */
-        err = JSON_PARSE_ERROR_INVALID_END;
     }
     else
     {
@@ -3777,29 +3813,24 @@ JsonParseError JsonParseFileStrict(
         return JSON_PARSE_ERROR_NO_SUCH_FILE;
     }
 
-    bool truncated = false;
-    Writer *const contents = FileReadFromFd(fd, size_max, &truncated);
+    Writer *contents = NULL;
+    size_t total_read = 0;
+    JsonParseError error =
+        JsonReadFileNoNul(fd, size_max, &contents, &total_read);
     struct stat sb;
     const bool have_size = (fstat(fd, &sb) == 0);
     close(fd);
-    if (contents == NULL)
+    if (error != JSON_PARSE_OK)
     {
-        return JSON_PARSE_ERROR_NO_SUCH_FILE;
-    }
-    if (truncated)
-    {
-        WriterClose(contents);
-        return JSON_PARSE_ERROR_TRUNCATED;
+        return error;
     }
 
     const char *data = StringWriterData(contents);
-    JsonParseError error;
-    if (!have_size || (size_t) sb.st_size != StringWriterLength(contents))
+    if (!have_size || sb.st_size < 0
+        || (uintmax_t) sb.st_size != (uintmax_t) total_read)
     {
-        /* The Writer is a C string: a null byte ends it early and hides
-         * the rest of the file from the parser, so fewer bytes arrive than
-         * the file holds. A file that changed while it was read is refused
-         * too. */
+        /* Refuse non-regular files, fstat failures, or files whose size
+         * changed while being read. */
         error = JSON_PARSE_ERROR_INVALID_END;
     }
     else
