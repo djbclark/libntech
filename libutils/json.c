@@ -3707,25 +3707,44 @@ JsonParseError JsonParseAnyFile(
     const bool yaml_format)
 {
     assert(json_out != NULL);
+    *json_out = NULL;
+
+    const int fd = safe_open(path, O_RDONLY);
+    if (fd == -1)
+    {
+        return JSON_PARSE_ERROR_NO_SUCH_FILE;
+    }
 
     bool truncated = false;
-    Writer *contents = FileRead(path, size_max, &truncated);
+    Writer *const contents = FileReadFromFd(fd, size_max, &truncated);
+    struct stat sb;
+    const bool have_size = (fstat(fd, &sb) == 0);
+    close(fd);
     if (contents == NULL)
     {
         return JSON_PARSE_ERROR_NO_SUCH_FILE;
     }
-    else if (truncated)
+    if (truncated)
     {
+        WriterClose(contents);
         return JSON_PARSE_ERROR_TRUNCATED;
     }
-    assert(json_out);
-    *json_out = NULL;
+
     const char *data = StringWriterData(contents);
     JsonParseError err;
 
     if (yaml_format)
     {
         err = JsonParseYamlString(&data, json_out);
+    }
+    else if (have_size && S_ISREG(sb.st_mode)
+             && (sb.st_size < 0
+                 || (size_t) sb.st_size != StringWriterLength(contents)))
+    {
+        /* The Writer is a C string: a null byte truncates a read chunk
+         * early and hides the rest of the file from the parser, so fewer
+         * bytes arrive than the file holds. */
+        err = JSON_PARSE_ERROR_INVALID_END;
     }
     else
     {

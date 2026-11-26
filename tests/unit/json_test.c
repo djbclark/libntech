@@ -2,6 +2,7 @@
 #include <logging.h>
 
 #include <json.h>
+#include <json-utils.h>
 #include <string_lib.h>
 #include <file_lib.h>
 #include <misc_lib.h> /* xsnprintf */
@@ -2731,6 +2732,132 @@ static void test_parse_file_lenient_unchanged(void)
     unlink(filename);
 }
 
+static void assert_raw_nul_file_refused(
+    const char *const content, const size_t length, const size_t size_max)
+{
+    char filename[] = "/tmp/json_test_rawnul_XXXXXX";
+    write_strict_test_file(filename, content, length);
+
+    JsonElement *json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        JsonParseFileStrict(filename, size_max, &json));
+    assert_true(json == NULL);
+
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        JsonParseFile(filename, size_max, &json));
+    assert_true(json == NULL);
+
+    json = JsonReadDataFile(
+        "json_test", filename, DATAFILETYPE_JSON, size_max, false);
+    assert_true(json == NULL);
+
+    unlink(filename);
+}
+
+static void assert_healthy_json_file_accepted(
+    const char *const content, const size_t length, const size_t size_max)
+{
+    char filename[] = "/tmp/json_test_healthy_XXXXXX";
+    write_strict_test_file(filename, content, length);
+
+    JsonElement *json = NULL;
+    assert_int_equal(
+        JSON_PARSE_OK, JsonParseFileStrict(filename, size_max, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseFile(filename, size_max, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    json = JsonReadDataFile(
+        "json_test", filename, DATAFILETYPE_JSON, size_max, false);
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    unlink(filename);
+}
+
+static void test_parse_file_raw_nul_boundaries(void)
+{
+    /* Trailing-NUL-only: {}\0 (7b 7d 00) and {}\n\0 (7b 7d 0a 00). */
+    static const char trailing_nul[] = { '{', '}', '\0' };
+    static const char trailing_lf_nul[] = { '{', '}', '\n', '\0' };
+    assert_raw_nul_file_refused(trailing_nul, sizeof(trailing_nul), 1024);
+    assert_raw_nul_file_refused(
+        trailing_lf_nul, sizeof(trailing_lf_nul), 1024);
+
+    /* Leading-NUL: \0{} (00 7b 7d) must give INVALID_END, not NO_DATA. */
+    static const char leading_nul[] = { '\0', '{', '}' };
+    assert_raw_nul_file_refused(leading_nul, sizeof(leading_nul), 1024);
+
+    /* Mid-file NUL hiding trailing garbage. */
+    static const char mid_nul[] = "{\"vars\": {}}\0not-json";
+    assert_raw_nul_file_refused(mid_nul, sizeof(mid_nul) - 1, 1024);
+
+    /* Chunk-boundary NUL: valid JSON padded past READ_BUFSIZE (> 8192 bytes)
+     * with a single 0x00 as its final byte. */
+    const size_t pad = 8192;
+    const size_t padded_len = pad + 2; /* 8192 spaces + "{}" */
+    char *padded = xmalloc(padded_len + 1);
+    memset(padded, ' ', pad);
+    padded[pad] = '{';
+    padded[pad + 1] = '}';
+    padded[padded_len] = '\0';
+
+    assert_raw_nul_file_refused(padded, padded_len + 1, 16384);
+    assert_healthy_json_file_accepted(padded, padded_len, 16384);
+    free(padded);
+
+    /* Also verify a large JSON string (> 8192 bytes) with trailing 0x00. */
+    const size_t str_pad = 8200;
+    const char *prefix = "{\"k\":\"";
+    const char *suffix = "\"}";
+    const size_t big_len = strlen(prefix) + str_pad + strlen(suffix);
+    char *big = xmalloc(big_len + 1);
+    memcpy(big, prefix, strlen(prefix));
+    memset(big + strlen(prefix), 'a', str_pad);
+    memcpy(big + strlen(prefix) + str_pad, suffix, strlen(suffix));
+    big[big_len] = '\0';
+
+    assert_raw_nul_file_refused(big, big_len + 1, 16384);
+    assert_healthy_json_file_accepted(big, big_len, 16384);
+    free(big);
+
+    /* Healthy controls: {} (7b 7d) and {}\n (7b 7d 0a). */
+    assert_healthy_json_file_accepted("{}", 2, 1024);
+    assert_healthy_json_file_accepted("{}\n", 3, 1024);
+
+    /* Lenient JsonParseFile() / JsonReadDataFile() still keep duplicate-last-wins,
+     * ignored trailing non-NUL input, and clean truncation handling. */
+    char filename[] = "/tmp/json_test_lenient_ctrl_XXXXXX";
+    const char lenient_doc[] = "{\"a\": \"1\", \"a\": \"2\"} trailing\n";
+    write_strict_test_file(filename, lenient_doc, sizeof(lenient_doc) - 1);
+
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseFile(filename, 1024, &json));
+    assert_true(json != NULL);
+    assert_string_equal("2", JsonObjectGetAsString(json, "a"));
+    JsonDestroy(json);
+
+    json = JsonReadDataFile(
+        "json_test", filename, DATAFILETYPE_JSON, 1024, false);
+    assert_true(json != NULL);
+    assert_string_equal("2", JsonObjectGetAsString(json, "a"));
+    JsonDestroy(json);
+
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_TRUNCATED, JsonParseFile(filename, 8, &json));
+    assert_true(json == NULL);
+
+    unlink(filename);
+}
+
 static void test_detach_key_from_object(void)
 {
     JsonElement *object = JsonObjectCreate(3);
@@ -3927,6 +4054,7 @@ int main()
         unit_test(test_parse_strict_error_string),
         unit_test(test_parse_file_strict),
         unit_test(test_parse_file_lenient_unchanged),
+        unit_test(test_parse_file_raw_nul_boundaries),
         unit_test(test_array_get_string),
         unit_test(test_array_iterator),
         unit_test(test_array_remove_range),
