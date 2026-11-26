@@ -2487,6 +2487,43 @@ static void test_json_parse_object_missing_comma(void)
     }
 }
 
+static void test_parse_string_trailing_backslash(void)
+{
+    /* Exact-sized heap buffers so ASan catches any read past the NUL. */
+    const char *const cases[] = {
+        "\"x\\",
+        "\"\\",
+        "{\"a\": \"x\\",
+        "{\"x\\",
+        "[\"x\\",
+        NULL
+    };
+
+    for (size_t i = 0; cases[i] != NULL; i++)
+    {
+        const size_t len = strlen(cases[i]);
+        char *buf = xmalloc(len + 1);
+        memcpy(buf, cases[i], len + 1);
+
+        const char *data = buf;
+        JsonElement *json = NULL;
+        assert_int_equal(
+            JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END,
+            JsonParse(&data, &json));
+        assert_true(json == NULL);
+
+        free(buf);
+    }
+
+    /* Escaped trailing backslash before the closing quote still parses. */
+    const char *valid = "\"x\\\\\"";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&valid, &json));
+    assert_true(json != NULL);
+    assert_string_equal("x\\", JsonPrimitiveGetAsString(json));
+    JsonDestroy(json);
+}
+
 int main()
 {
     PRINT_TEST_BANNER();
@@ -2560,6 +2597,7 @@ int main()
         unit_test(test_compare_container_type_mismatch),
         unit_test(test_json_get_type_as_string),
         unit_test(test_json_parse_object_missing_comma),
+        unit_test(test_parse_string_trailing_backslash),
     };
 
     return run_tests(tests);
