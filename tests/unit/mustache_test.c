@@ -1,8 +1,44 @@
 #include <test.h>
 
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 #include <mustache.h>
 #include <buffer.h>
 #include <json.h>
+
+static int stdout_saved = -1;
+static char stdout_path[64];
+
+static void StartCapturingLog(void)
+{
+    fflush(stdout);
+    strlcpy(stdout_path, "/tmp/mustache_test_log_XXXXXX", sizeof(stdout_path));
+    int fd = mkstemp(stdout_path);
+    assert_true(fd >= 0);
+    stdout_saved = dup(STDOUT_FILENO);
+    assert_true(stdout_saved >= 0);
+    assert_true(dup2(fd, STDOUT_FILENO) >= 0);
+    close(fd);
+}
+
+static void StopCapturingLog(char *const buffer, const size_t size)
+{
+    fflush(stdout);
+    dup2(stdout_saved, STDOUT_FILENO);
+    close(stdout_saved);
+    stdout_saved = -1;
+
+    size_t got = 0;
+    FILE *file = fopen(stdout_path, "r");
+    if (file != NULL)
+    {
+        got = fread(buffer, 1, size - 1, file);
+        fclose(file);
+    }
+    buffer[got] = '\0';
+    unlink(stdout_path);
+}
 
 /**
  * Renders #templ with #json_hash (a JSON document, or NULL for no hash) and
@@ -194,8 +230,30 @@ static void test_standalone_tags(void)
     assert_render("a\n{{#b}}\nx\n{{/b}}\nc\n", "{\"b\":true}", "a\nx\nc\n");
     assert_render("a\n{{#b}}\nx\n{{/b}}\nc\n", "{\"b\":false}", "a\nc\n");
 
+    /* Standalone tags at offset 0 (start of template). */
+    assert_render("{{#b}}\nx\n{{/b}}\nc\n", "{\"b\":true}", "x\nc\n");
+    assert_render("{{#b}}\nx\n{{/b}}\nc\n", "{\"b\":false}", "c\n");
+    assert_render("{{!c}}\nx\n", "{}", "x\n");
+
     /* A variable is not standalone, so its line is kept. */
     assert_render("a\n {{v}} \nc\n", "{\"v\":\"V\"}", "a\n V \nc\n");
+}
+
+static void assert_render_fails_log(
+    const char *const templ,
+    const char *const expected_substr,
+    const char *const forbidden_substr)
+{
+    char log[4096];
+    StartCapturingLog();
+    assert_render_fails(templ, "{\"v\":1}");
+    StopCapturingLog(log, sizeof(log));
+
+    assert_true(strstr(log, expected_substr) != NULL);
+    if (forbidden_substr != NULL)
+    {
+        assert_true(strstr(log, forbidden_substr) == NULL);
+    }
 }
 
 static void test_malformed_templates(void)
@@ -204,6 +262,34 @@ static void test_malformed_templates(void)
     assert_render_fails("a{{{v}}", "{\"v\":1}");
     assert_render_fails("a{{/x}}b", "{}");
     assert_render_fails("a{{#v}}b", "{\"v\":true}");
+}
+
+static void test_malformed_template_log_excerpt(void)
+{
+    /* Short malformed templates (< 20 bytes remaining): exact remaining
+     * bytes appear in the '%.20s' excerpt with no padding. */
+    assert_render_fails_log(
+        "a{{v",
+        "could not find end delimiter after reading start delimiter"
+        " at 'a{{v'...",
+        NULL);
+    assert_render_fails_log(
+        "a{{{v}}",
+        "couldn't find end tag for quoted begin tag at 'a{{{v}}'...",
+        NULL);
+
+    /* Long malformed templates (> 20 bytes remaining): excerpt contains
+     * exact first 20 bytes and the sentinel beyond byte 20 never appears. */
+    assert_render_fails_log(
+        "0123456789{{abcdefghSENTINEL_MUST_NOT_APPEAR",
+        "could not find end delimiter after reading start delimiter"
+        " at '0123456789{{abcdefgh'...",
+        "SENTINEL_MUST_NOT_APPEAR");
+    assert_render_fails_log(
+        "0123456789{{{abcdefgSENTINEL_MUST_NOT_APPEAR",
+        "couldn't find end tag for quoted begin tag"
+        " at '0123456789{{{abcdefg'...",
+        "SENTINEL_MUST_NOT_APPEAR");
 }
 
 static void test_no_expansion(void)
@@ -236,6 +322,7 @@ int main(void)
         unit_test(test_set_delimiters),
         unit_test(test_standalone_tags),
         unit_test(test_malformed_templates),
+        unit_test(test_malformed_template_log_excerpt),
         unit_test(test_no_expansion),
     };
 
