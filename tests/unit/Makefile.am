@@ -61,6 +61,7 @@ check_PROGRAMS = \
 	xml_writer_test \
 	sequence_test \
 	json_test \
+	mustache_test \
 	misc_lib_test \
 	string_lib_test \
 	thread_test \
@@ -93,7 +94,8 @@ endif
 
 if WITH_OPENSSL
 check_PROGRAMS += \
-	hash_test
+	hash_test \
+	hash_init_fail_test
 endif
 
 TESTS = $(check_PROGRAMS)
@@ -146,6 +148,8 @@ logging_timestamp_test_SOURCES = logging_timestamp_test.c \
 
 hash_test_SOURCES = hash_test.c
 
+hash_init_fail_test_SOURCES = hash_init_fail_test.c
+
 libcompat_test_CPPFLAGS = -I$(top_srcdir)/libcompat -I$(top_srcdir)/libutils
 libcompat_test_SOURCES = libcompat_test.c
 
@@ -167,5 +171,7 @@ threaded_stack_test_SOURCES = threaded_stack_test.c
 file_lock_test_SOURCES = file_lock_test.c
 
 glob_lib_test_SOURCES = glob_lib_test.c
+
+mustache_test_SOURCES = mustache_test.c
 
 string_sequence_test_SOURCES = string_sequence_test.c

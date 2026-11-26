@@ -2,12 +2,18 @@
 #include <logging.h>
 
 #include <json.h>
+#include <json-utils.h>
 #include <string_lib.h>
 #include <file_lib.h>
 #include <misc_lib.h> /* xsnprintf */
 #include <alloc.h>    // xasprintf()
 
 #include <float.h>
+#ifndef __MINGW32__
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#endif
 
 
 static const char *OBJECT_ARRAY =
@@ -90,6 +96,29 @@ static JsonElement *LoadTestFile(const char *filename)
 
     WriterClose(w);
     return json;
+}
+
+static void CheckRealRendersAsParsed(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(JSON_PRIMITIVE_TYPE_REAL, JsonGetPrimitiveType(json));
+
+    // JsonPrimitiveToString() returns the number as it was parsed ...
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal(number, str);
+    free(str);
+
+    // ... which is what JsonWriteCompact() emits for the same element
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(json);
 }
 
 static void test_new_delete(void)
@@ -751,6 +780,71 @@ static void test_parse_object_escaped(void)
     JsonDestroy(obj);
 }
 
+/* CFE-4731: JsonParseAsString() and JsonDecodeString() used to both
+ * unescape backslash sequences, run one after the other over the same
+ * text. Any backslash JsonParseAsString() produced (from a \\ escape, or
+ * from a still-verbatim \uXXXX before that was folded in) was then
+ * re-interpreted as an escape introducer by JsonDecodeString(), silently
+ * corrupting any string containing an escaped backslash. These parse a
+ * full JSON document (unlike the JsonDecodeString()-only cases above) so
+ * they exercise the double-decode integration bug specifically. */
+static void test_parse_string_not_double_decoded(void)
+{
+    // A Windows path: the escaped backslashes must stay literal
+    // backslashes, not be re-decoded as \t and \n escape introducers.
+    {
+        const char *data = "{\"p\": \"C:\\\\temp\\\\new\"}";
+        JsonElement *obj = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+        assert_string_equal(JsonObjectGetAsString(obj, "p"), "C:\\temp\\new");
+        JsonDestroy(obj);
+    }
+
+    // An escaped backslash immediately followed by 'u0041' must stay as
+    // literal text, not be re-decoded as if it were the \u0041 escape.
+    {
+        const char *data = "{\"p\": \"\\\\u0041\"}";
+        JsonElement *obj = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+        assert_string_equal(JsonObjectGetAsString(obj, "p"), "\\u0041");
+        JsonDestroy(obj);
+    }
+
+    // An escaped backslash immediately followed by 't' must stay literal,
+    // not be re-decoded into a real tab character.
+    {
+        const char *data = "{\"p\": \"a\\\\tb\"}";
+        JsonElement *obj = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+        assert_string_equal(JsonObjectGetAsString(obj, "p"), "a\\tb");
+        JsonDestroy(obj);
+    }
+
+    // A genuine \u escape (single backslash) in a string VALUE must still
+    // decode correctly now that JsonParseAsString() owns \u handling.
+    {
+        const char *data = "{\"p\": \"caf\\u00e9\"}";
+        JsonElement *obj = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+        assert_string_equal(JsonObjectGetAsString(obj, "p"), "caf\xc3\xa9");
+        JsonDestroy(obj);
+    }
+}
+
+/* CFE-4731 side effect: object property NAMES go through
+ * JsonParseAsString() but were never passed to JsonDecodeString(), so a
+ * \u escape in a key was left as six literal characters instead of being
+ * decoded. Moving \u handling into JsonParseAsString() fixes this for
+ * free, since keys and values now share the same decoding path. */
+static void test_parse_object_key_unicode_escape(void)
+{
+    const char *data = "{\"\\u0041\": \"value\"}";
+    JsonElement *obj = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &obj));
+    assert_string_equal(JsonObjectGetAsString(obj, "A"), "value");
+    JsonDestroy(obj);
+}
+
 static void test_parse_tzz_evil_key(void)
 {
     const char *data =
@@ -1241,6 +1335,173 @@ static void test_parse_good_numbers(void)
     }
 }
 
+static void CheckNumberIsReal(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+
+    // The classification is checked before anything renders, so that a
+    // regression fails this assertion instead of exiting the test binary
+    assert_int_equal(JSON_PRIMITIVE_TYPE_REAL, JsonGetPrimitiveType(json));
+
+    // Rendering must return; it used to reach StringToLongExitOnError()
+    // and terminate the process when an exponent-notation number was
+    // classified as an integer. Since reals render from the text they were
+    // parsed from, the rendered form is the number as written.
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal(number, str);
+    free(str);
+
+    // Serialisation emits the number as it was parsed
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
+static void test_parse_exponent_numbers(void)
+{
+    // A number in exponent notation is a real, whether or not it also has
+    // a decimal point. These used to be classified as integers when no dot
+    // was seen, storing a lexeme strtol() cannot read, so rendering one
+    // terminated the process.
+    CheckNumberIsReal("1e-8");
+    CheckNumberIsReal("1E5");
+    CheckNumberIsReal("2e0");
+    CheckNumberIsReal("-2e-3");
+
+    // A number with both a dot and an exponent was a real all along;
+    // guard against regressing it
+    CheckNumberIsReal("1.5e3");
+}
+
+static void CheckIntegerRendersAsParsed(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(JSON_PRIMITIVE_TYPE_INTEGER, JsonGetPrimitiveType(json));
+
+    // JsonPrimitiveToString() returns the number as it was parsed ...
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal(number, str);
+    free(str);
+
+    // ... which is what JsonWriteCompact() emits for the same element
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
+static void test_primitive_to_string_numbers(void)
+{
+    // Integers that fit in a long render exactly as they always did
+    CheckIntegerRendersAsParsed("0");
+    CheckIntegerRendersAsParsed("42");
+    CheckIntegerRendersAsParsed("-42");
+    CheckIntegerRendersAsParsed("9223372036854775807"); // largest 64-bit long
+
+    // JSON puts no limit on the magnitude of a number. Converting these
+    // through long used to reach StringToLongExitOnError() and terminate
+    // the process; now they render as parsed.
+    CheckIntegerRendersAsParsed("9223372036854775808"); // one past it
+    CheckIntegerRendersAsParsed("-9223372036854775809");
+    CheckIntegerRendersAsParsed("1000000000000000000000000000000"); // 10^30
+
+    // Reals render as parsed, as the preceding change established. The
+    // exponent forms are the ones this change moves onto that path: before
+    // it they were classified as integers, and rendering one terminated
+    // the process.
+    CheckRealRendersAsParsed("0.5");
+    CheckRealRendersAsParsed("1e-8");
+    CheckRealRendersAsParsed("2e0");
+    CheckRealRendersAsParsed("1.5e3");
+
+    // A magnitude that overflows double. Converting through strtod() would
+    // return HUGE_VAL and "%.2f" would print "inf", which is not a JSON
+    // token; JsonWriteCompact() emits the lexeme, so rendering and
+    // serialising the same element would disagree.
+    CheckRealRendersAsParsed("1e400");
+    CheckRealRendersAsParsed("-1e400");
+}
+
+static void CheckNumberSurvivesCopy(const char *const number)
+{
+    const char *data = number;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+
+    JsonElement *copy = JsonCopy(json);
+    assert_true(copy != NULL);
+
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, copy);
+    char *output = StringWriterClose(writer);
+    assert_string_equal(number, output);
+    free(output);
+
+    JsonDestroy(copy);
+    JsonDestroy(json);
+}
+
+static void test_copy_preserves_numbers(void)
+{
+    // A copy must equal its original. Rebuilding the number from a C
+    // numeric type did not: JsonIntegerCreate() takes an int, so a long
+    // was silently narrowed, and JsonRealCreate() formats with "%.4f".
+    CheckNumberSurvivesCopy("0");
+    CheckNumberSurvivesCopy("42");
+    CheckNumberSurvivesCopy("-42");
+
+    CheckNumberSurvivesCopy("2000000000000");       // copied as -1454759936
+    CheckNumberSurvivesCopy("9223372036854775807"); // copied as -1
+
+    // Magnitudes no long can hold used to terminate the process on copy
+    CheckNumberSurvivesCopy("9223372036854775808");
+    CheckNumberSurvivesCopy("1000000000000000000000000000000");
+
+    CheckNumberSurvivesCopy("0.5");        // copied as 0.5000
+    CheckNumberSurvivesCopy("0.00049");    // copied as 0.0005
+    CheckNumberSurvivesCopy("3.14159265"); // copied as 3.1416
+    CheckNumberSurvivesCopy("1e-8");
+}
+
+static void test_select_oversized_array_index(void)
+{
+    const char *data = "[1, 2, 3]";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+
+    // An all-digit index too large for a long cannot select anything. It
+    // used to reach StringToLongExitOnError() and terminate the process.
+    const char *huge[] = {"9223372036854775808"};
+    assert_true(JsonSelect(json, 1, (char **) huge) == NULL);
+
+    const char *huger[] = {"1000000000000000000000000000000"};
+    assert_true(JsonSelect(json, 1, (char **) huger) == NULL);
+
+    // Indices that do fit still behave as before
+    const char *first[] = {"0"};
+    assert_true(JsonSelect(json, 1, (char **) first) != NULL);
+
+    const char *past_end[] = {"3"};
+    assert_true(JsonSelect(json, 1, (char **) past_end) == NULL);
+
+    JsonDestroy(json);
+}
+
 static void test_parse_bad_numbers(void)
 {
     {
@@ -1662,6 +1923,1030 @@ static void test_remove_key_from_object(void)
     JsonDestroy(object);
 }
 
+/* Strict parsing: JsonParseStrict() and JsonParseFileStrict() refuse what the
+ * lenient functions repair, and the lenient functions stay as they were. */
+
+static void assert_strict_refused(
+    const char *const text, const JsonParseError expected)
+{
+    const char *data = text;
+    JsonElement *json = NULL;
+    assert_int_equal(expected, JsonParseStrict(&data, &json));
+    assert_true(json == NULL);
+}
+
+static void test_parse_strict_valid(void)
+{
+    const char *data =
+        "{\"vars\": {\"a\": \"1\", \"b\": null},"
+        " \"list\": [{\"k\": 1}, {\"k\": 2}, [{\"k\": 3}]],"
+        " \"other\": {\"a\": \"2\"}, \"plain\": true}";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    assert_string_equal("1", JsonObjectGetAsString(
+                                 JsonObjectGetAsObject(json, "vars"), "a"));
+    assert_string_equal("2", JsonObjectGetAsString(
+                                 JsonObjectGetAsObject(json, "other"), "a"));
+    assert_int_equal(3, JsonLength(JsonObjectGet(json, "list")));
+    JsonDestroy(json);
+
+    /* Whitespace is the only thing allowed after the document. */
+    data = "{}  \n\t\r ";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    data = "[]\n";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    JsonDestroy(json);
+
+    data = " 12 ";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    JsonDestroy(json);
+
+    data = "\"s\"";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    JsonDestroy(json);
+}
+
+static void test_parse_strict_duplicate_member(void)
+{
+    /* Top level, nested, and in an object inside an array. */
+    assert_strict_refused(
+        "{\"a\": \"1\", \"a\": \"2\"}",
+        JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+    assert_strict_refused(
+        "{\"vars\": {\"x\": \"1\", \"y\": \"2\", \"x\": \"3\"}}",
+        JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+    assert_strict_refused(
+        "{\"l\": [{\"k\": 1}, {\"k\": 1, \"k\": 2}]}",
+        JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+    assert_strict_refused(
+        "[[{\"a\": {\"b\": [], \"b\": []}}]]",
+        JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+
+    /* Whatever the value types, however far apart the two are. */
+    assert_strict_refused(
+        "{\"a\": {}, \"b\": 1, \"a\": []}",
+        JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+    assert_strict_refused(
+        "{\"a\": true, \"a\": true}", JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+}
+
+static void test_parse_strict_non_json_forms(void)
+{
+    /* Unquoted object keys are refused in strict mode. */
+    assert_strict_refused("{a: 1}", JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL);
+    assert_strict_refused("{plain: true}", JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL);
+    assert_strict_refused(
+        "{\"ok\": 1, bad: 2}", JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL);
+
+    /* Missing colons between object key and value are refused. */
+    assert_strict_refused("{\"a\" \"b\"}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" 1}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" []}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" {}}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" true}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" null}", JSON_PARSE_ERROR_OBJECT_COLON);
+
+    /* \u0000 escapes are refused in strict mode (keys, values, arrays, top). */
+    assert_strict_refused(
+        "\"a\\u0000b\"", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_strict_refused(
+        "{\"a\\u0000b\": 1}", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_strict_refused(
+        "{\"a\": \"x\\u0000y\"}", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_strict_refused(
+        "[\"\\u0000\"]", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_strict_refused(
+        "\"\\\\\\u0000\"", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+
+    /* Escaped backslash followed by literal u0000 is not a null escape. */
+    const char *data = "{\"a\": \"\\\\u0000\"}";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    /* Truncated \u escapes are rejected as invalid escapes without OOB read. */
+    assert_strict_refused("\"\\u", JSON_PARSE_ERROR_STRING_INVALID_ESCAPE);
+    assert_strict_refused("\"\\u00", JSON_PARSE_ERROR_STRING_INVALID_ESCAPE);
+
+    /* Lenient JsonParse() still accepts unquoted keys. */
+    data = "{plain: true}";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+}
+
+static void test_parse_strict_commas_and_array_separators(void)
+{
+    /* Trailing and leading commas in objects and arrays are refused. */
+    assert_strict_refused("{\"a\": 1,}", JSON_PARSE_ERROR_OBJECT_COMMA);
+    assert_strict_refused("{, \"a\": 1}", JSON_PARSE_ERROR_OBJECT_COMMA);
+    assert_strict_refused("{,}", JSON_PARSE_ERROR_OBJECT_COMMA);
+    assert_strict_refused("[1,]", JSON_PARSE_ERROR_ARRAY_COMMA);
+    assert_strict_refused("[, 1]", JSON_PARSE_ERROR_ARRAY_COMMA);
+    assert_strict_refused("[,]", JSON_PARSE_ERROR_ARRAY_COMMA);
+    assert_strict_refused("{\"a\": [1,]}", JSON_PARSE_ERROR_ARRAY_COMMA);
+
+    /* Missing commas between array elements are refused. */
+    assert_strict_refused("[\"a\" \"b\"]", JSON_PARSE_ERROR_ARRAY_COMMA);
+    assert_strict_refused("[1 2]", JSON_PARSE_ERROR_ARRAY_COMMA);
+    assert_strict_refused("[true null \"x\"]", JSON_PARSE_ERROR_ARRAY_COMMA);
+    assert_strict_refused("[[] \"a\"]", JSON_PARSE_ERROR_ARRAY_COMMA);
+    assert_strict_refused("[{} 1]", JSON_PARSE_ERROR_ARRAY_COMMA);
+    assert_strict_refused("[1 []]", JSON_PARSE_ERROR_ARRAY_START);
+    assert_strict_refused("[\"a\" {}]", JSON_PARSE_ERROR_ARRAY_START);
+    assert_strict_refused("[1\"a\"]", JSON_PARSE_ERROR_NUMBER_BAD_SYMBOL);
+    assert_strict_refused("[\"a\"1]", JSON_PARSE_ERROR_ARRAY_COMMA);
+
+    /* Valid arrays and objects still parse cleanly. */
+    const char *data = "[1, \"a\", true, false, null, [], {\"k\": \"v\"}]";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(7, JsonLength(json));
+    JsonDestroy(json);
+
+    /* Lenient JsonParse() keeps accepting trailing commas. */
+    data = "{\"a\": 1,}";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    data = "[1,]";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+}
+
+static void test_parse_strict_control_chars_and_escapes(void)
+{
+    /* Raw unescaped control characters 0x01..0x1f are refused in strings
+     * (values and keys). */
+    for (unsigned char c = 1; c < 0x20; c++)
+    {
+        char val_doc[] = "{\"k\": \"aXb\"}";
+        val_doc[8] = (char) c;
+        assert_strict_refused(val_doc, JSON_PARSE_ERROR_STRING_CONTROL_CHAR);
+
+        char key_doc[] = "{\"aXb\": 1}";
+        key_doc[3] = (char) c;
+        assert_strict_refused(key_doc, JSON_PARSE_ERROR_STRING_CONTROL_CHAR);
+    }
+
+    /* Escaped control characters and valid escapes still parse. */
+    const char *data = "\"\\b\\f\\n\\r\\t\\/\\\\\\\"\\u001f\\u0041\"";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    /* Valid UTF-16 surrogate pair parses cleanly. */
+    data = "\"\\uD83D\\uDE00\"";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    /* Unrecognized escapes and malformed \u / unpaired surrogates are refused. */
+    const char *const bad_escapes[] = {
+        "\"\\a\"",
+        "\"\\U0000\"",
+        "\"\\'\"",
+        "\"\\x41\"",
+        "\"\\1\"",
+        "\"\\u\"",
+        "\"\\u1\"",
+        "\"\\u123\"",
+        "\"\\u123g\"",
+        "\"\\uD800\"",
+        "\"\\uD83Dx\"",
+        "\"\\uD83D\\u0041\"",
+        "\"\\uD800\\uD800\\uDC00\"",
+        "\"\\uD83D\\uDE00\\uDC00\"",
+        "\"\\uD83D\\\\uDE00\"",
+        "\"\\uDC00\"",
+        "\"\\uDFFF\"",
+        "{\"\\a\": 1}",
+        "[\"\\uD83D\"]",
+        NULL
+    };
+    for (size_t i = 0; bad_escapes[i] != NULL; i++)
+    {
+        assert_strict_refused(
+            bad_escapes[i], JSON_PARSE_ERROR_STRING_INVALID_ESCAPE);
+    }
+
+    /* Exact-sized heap buffers for truncated surrogate pairs (ASan OOB proof). */
+    const char *const trunc_cases[] = {
+        "\"\\u",
+        "\"\\u00",
+        "\"\\uD83D",
+        "\"\\uD83D\\",
+        "\"\\uD83D\\u",
+        "\"\\uD83D\\uDE",
+        NULL
+    };
+    for (size_t i = 0; trunc_cases[i] != NULL; i++)
+    {
+        const size_t len = strlen(trunc_cases[i]);
+        char *buf = xmalloc(len + 1);
+        memcpy(buf, trunc_cases[i], len + 1);
+        const char *p = buf;
+        JsonElement *out = NULL;
+        assert_int_equal(
+            JSON_PARSE_ERROR_STRING_INVALID_ESCAPE, JsonParseStrict(&p, &out));
+        assert_true(out == NULL);
+        free(buf);
+    }
+
+    /* Lenient JsonParse() still keeps unrecognized escapes and raw tab. */
+    data = "\"\\a\t\"";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+}
+
+static void test_parse_strict_negative_leading_zero(void)
+{
+    assert_strict_refused("-00", JSON_PARSE_ERROR_NUMBER_DUPLICATE_ZERO);
+    assert_strict_refused(
+        "-01", JSON_PARSE_ERROR_NUMBER_EXPONENT_FOLLOW_LEADING_ZERO);
+    assert_strict_refused("-00.5", JSON_PARSE_ERROR_NUMBER_DUPLICATE_ZERO);
+    assert_strict_refused(
+        "-01e2", JSON_PARSE_ERROR_NUMBER_EXPONENT_FOLLOW_LEADING_ZERO);
+    assert_strict_refused(
+        "[-01]", JSON_PARSE_ERROR_NUMBER_EXPONENT_FOLLOW_LEADING_ZERO);
+    assert_strict_refused(
+        "{\"n\": -00}", JSON_PARSE_ERROR_NUMBER_DUPLICATE_ZERO);
+    assert_strict_refused("1e2.3", JSON_PARSE_ERROR_NUMBER_BAD_SYMBOL);
+    assert_strict_refused("1E-2.5", JSON_PARSE_ERROR_NUMBER_BAD_SYMBOL);
+    assert_strict_refused("0e0.0", JSON_PARSE_ERROR_NUMBER_BAD_SYMBOL);
+    assert_strict_refused("[1e2.3]", JSON_PARSE_ERROR_NUMBER_BAD_SYMBOL);
+    assert_strict_refused(
+        "{\"n\": 1E-2.5}", JSON_PARSE_ERROR_NUMBER_BAD_SYMBOL);
+
+    /* Valid zero and negative numbers still parse cleanly. */
+    const char *const valid_nums[] = {
+        "0", "-0", "-0.5", "-0e1", "-0E-1", "1e-05", "0e-05", "-10",
+        "[-0, -0.5, -0e1, 1e-05]",
+        "{\"a\": -0, \"b\": -0.5, \"c\": -0e1, \"d\": 1e-05}",
+        NULL
+    };
+    for (size_t i = 0; valid_nums[i] != NULL; i++)
+    {
+        const char *data = valid_nums[i];
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+        assert_true(json != NULL);
+        JsonDestroy(json);
+    }
+
+    /* Lenient JsonParse() keeps accepting -01, but still rejects decimal point
+     * after exponent (which would poison REAL -> StringToDouble assert). */
+    const char *data = "-01";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    const char *const bad_lenient_exp_dot[] = {
+        "1e2.3", "1E-2.5", "0e0.0", "[1e2.3]", NULL
+    };
+    for (size_t i = 0; bad_lenient_exp_dot[i] != NULL; i++)
+    {
+        data = bad_lenient_exp_dot[i];
+        json = NULL;
+        assert_int_equal(
+            JSON_PARSE_ERROR_NUMBER_BAD_SYMBOL, JsonParse(&data, &json));
+        assert_true(json == NULL);
+    }
+}
+
+static void test_parse_strict_utf8(void)
+{
+    /* Valid 2-, 3-, and 4-byte RFC 3629 UTF-8 sequences in values and keys. */
+    const char *const valid_utf8[] = {
+        "\"\xc2\xa2\"",                   /* U+00A2 */
+        "\"\xc3\xa9\"",                   /* U+00E9 */
+        "\"\xdf\xbf\"",                   /* U+07FF */
+        "\"\xe0\xa0\x80\"",               /* U+0800 */
+        "\"\xe2\x82\xac\"",               /* U+20AC */
+        "\"\xed\x9f\xbf\"",               /* U+D7FF */
+        "\"\xee\x80\x80\"",               /* U+E000 */
+        "\"\xef\xbf\xbf\"",               /* U+FFFF */
+        "\"\xf0\x90\x80\x80\"",           /* U+10000 */
+        "\"\xf0\x9f\x98\x80\"",           /* U+1F600 */
+        "\"\xf4\x8f\xbf\xbf\"",           /* U+10FFFF */
+        "{\"caf\xc3\xa9\": \"\xf0\x9f\x98\x80\"}",
+        NULL
+    };
+    for (size_t i = 0; valid_utf8[i] != NULL; i++)
+    {
+        const char *data = valid_utf8[i];
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+        assert_true(json != NULL);
+        JsonDestroy(json);
+    }
+
+    /* Verify decoded multi-byte UTF-8 bytes are preserved intact. */
+    {
+        const char *data = "{\"k\": \"caf\xc3\xa9 \xf0\x9f\x98\x80\"}";
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+        assert_string_equal(
+            "caf\xc3\xa9 \xf0\x9f\x98\x80", JsonObjectGetAsString(json, "k"));
+        JsonDestroy(json);
+    }
+
+    /* Invalid UTF-8 sequences are refused in strict mode. */
+    const char *const invalid_utf8[] = {
+        "\"\x80\"",                       /* lone continuation */
+        "\"\xbf\"",                       /* lone continuation */
+        "\"\xc0\xaf\"",                   /* overlong '/' */
+        "\"\xc1\xbf\"",                   /* overlong 2-byte */
+        "\"\xe0\x9f\xbf\"",               /* overlong 3-byte */
+        "\"\xed\xa0\x80\"",               /* UTF-8 high surrogate U+D800 */
+        "\"\xed\xbf\xbf\"",               /* UTF-8 low surrogate U+DFFF */
+        "\"\xf0\x8f\xbf\xbf\"",           /* overlong 4-byte */
+        "\"\xf4\x90\x80\x80\"",           /* > U+10FFFF */
+        "\"\xf5\x80\x80\x80\"",           /* invalid lead byte */
+        "\"\xfe\"",                       /* invalid byte */
+        "\"\xff\"",                       /* invalid byte */
+        "\"\xc2\"",                       /* truncated 2-byte before '"' */
+        "\"\xe2\x82\"",                   /* truncated 3-byte before '"' */
+        "\"\xf0\x9f\x98\"",               /* truncated 4-byte before '"' */
+        "{\"\x80\": 1}",                  /* invalid UTF-8 in object key */
+        "[\"\xed\xa0\x80\"]",             /* invalid UTF-8 in array */
+        NULL
+    };
+    for (size_t i = 0; invalid_utf8[i] != NULL; i++)
+    {
+        assert_strict_refused(
+            invalid_utf8[i], JSON_PARSE_ERROR_STRING_INVALID_UTF8);
+    }
+
+    /* Exact-sized heap buffers truncated right at NUL (ASan OOB proof). */
+    const char *const trunc_utf8[] = {
+        "\"\xc2",
+        "\"\xe2",
+        "\"\xe2\x82",
+        "\"\xf0",
+        "\"\xf0\x9f",
+        "\"\xf0\x9f\x98",
+        NULL
+    };
+    for (size_t i = 0; trunc_utf8[i] != NULL; i++)
+    {
+        const size_t len = strlen(trunc_utf8[i]);
+        char *buf = xmalloc(len + 1);
+        memcpy(buf, trunc_utf8[i], len + 1);
+        const char *p = buf;
+        JsonElement *out = NULL;
+        assert_int_equal(
+            JSON_PARSE_ERROR_STRING_INVALID_UTF8, JsonParseStrict(&p, &out));
+        assert_true(out == NULL);
+        free(buf);
+    }
+
+    /* Lenient JsonParse() keeps accepting raw non-UTF-8 bytes. */
+    const char *data = "\"\x80\xff\"";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+}
+
+static void test_parse_strict_max_members(void)
+{
+    /* 65536 members in one object succeed; 65537 exceed the cap. */
+    const size_t max_members = 65536;
+    Writer *w = StringWriter();
+    WriterWriteChar(w, '{');
+    for (size_t i = 0; i < max_members; i++)
+    {
+        if (i > 0)
+        {
+            WriterWriteChar(w, ',');
+        }
+        WriterWriteF(w, "\"m%zu\":0", i);
+    }
+    WriterWriteChar(w, '}');
+    char *ok_doc = StringWriterClose(w);
+
+    const char *data = ok_doc;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(max_members, JsonLength(json));
+    JsonDestroy(json);
+    free(ok_doc);
+
+    w = StringWriter();
+    WriterWriteChar(w, '{');
+    for (size_t i = 0; i <= max_members; i++)
+    {
+        if (i > 0)
+        {
+            WriterWriteChar(w, ',');
+        }
+        WriterWriteF(w, "\"m%zu\":0", i);
+    }
+    WriterWriteChar(w, '}');
+    char *too_many = StringWriterClose(w);
+    assert_strict_refused(too_many, JSON_PARSE_ERROR_MAX_MEMBERS);
+    free(too_many);
+
+    /* Large array of null/boolean literals parses in O(n) without strlen O(n^2). */
+    const size_t lit_count = 30000;
+    w = StringWriter();
+    WriterWriteChar(w, '[');
+    for (size_t i = 0; i < lit_count; i++)
+    {
+        if (i > 0)
+        {
+            WriterWriteChar(w, ',');
+        }
+        const char *lit = (i % 3 == 0) ? "null" : ((i % 3 == 1) ? "true" : "false");
+        WriterWrite(w, lit);
+    }
+    WriterWriteChar(w, ']');
+    char *lit_doc = StringWriterClose(w);
+    data = lit_doc;
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(lit_count, JsonLength(json));
+    JsonDestroy(json);
+    free(lit_doc);
+}
+
+static void test_parse_strict_large_object_linear(void)
+{
+    /* 10,000 unique keys: exercises O(n) hash-set duplicate tracking and
+     * direct append without O(n^2) rescans. */
+    const size_t n = 10000;
+    Writer *w = StringWriter();
+    WriterWriteChar(w, '{');
+    for (size_t i = 0; i < n; i++)
+    {
+        if (i > 0)
+        {
+            WriterWriteChar(w, ',');
+        }
+        WriterWriteF(w, "\"k%zu\":%zu", i, i);
+    }
+    WriterWriteChar(w, '}');
+    char *doc = StringWriterClose(w);
+
+    const char *data = doc;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(n, JsonLength(json));
+    JsonDestroy(json);
+    free(doc);
+
+    /* Duplicate at the tail of a large object is still refused. */
+    w = StringWriter();
+    WriterWriteChar(w, '{');
+    for (size_t i = 0; i < n; i++)
+    {
+        WriterWriteF(w, "\"k%zu\":%zu,", i, i);
+    }
+    WriterWrite(w, "\"k0\":0}");
+    doc = StringWriterClose(w);
+
+    data = doc;
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY, JsonParseStrict(&data, &json));
+    assert_true(json == NULL);
+    free(doc);
+}
+
+static void test_parse_strict_max_depth(void)
+{
+    /* 128 nested arrays succeed; 129 exceed the cap. */
+    const size_t max_depth = 128;
+    Writer *w = StringWriter();
+    for (size_t i = 0; i < max_depth; i++)
+    {
+        WriterWriteChar(w, '[');
+    }
+    for (size_t i = 0; i < max_depth; i++)
+    {
+        WriterWriteChar(w, ']');
+    }
+    char *ok_arr = StringWriterClose(w);
+
+    const char *data = ok_arr;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+    free(ok_arr);
+
+    w = StringWriter();
+    for (size_t i = 0; i < max_depth + 1; i++)
+    {
+        WriterWriteChar(w, '[');
+    }
+    for (size_t i = 0; i < max_depth + 1; i++)
+    {
+        WriterWriteChar(w, ']');
+    }
+    char *too_deep_arr = StringWriterClose(w);
+    assert_strict_refused(too_deep_arr, JSON_PARSE_ERROR_MAX_DEPTH);
+    free(too_deep_arr);
+
+    /* Same boundary for nested objects. */
+    w = StringWriter();
+    for (size_t i = 0; i < max_depth; i++)
+    {
+        WriterWrite(w, i + 1 < max_depth ? "{\"a\":" : "{}");
+    }
+    for (size_t i = 1; i < max_depth; i++)
+    {
+        WriterWriteChar(w, '}');
+    }
+    char *ok_obj = StringWriterClose(w);
+
+    data = ok_obj;
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+    free(ok_obj);
+
+    w = StringWriter();
+    for (size_t i = 0; i < max_depth + 1; i++)
+    {
+        WriterWrite(w, i < max_depth ? "{\"a\":" : "{}");
+    }
+    for (size_t i = 0; i < max_depth; i++)
+    {
+        WriterWriteChar(w, '}');
+    }
+    char *too_deep_obj = StringWriterClose(w);
+    assert_strict_refused(too_deep_obj, JSON_PARSE_ERROR_MAX_DEPTH);
+    free(too_deep_obj);
+}
+
+static void test_parse_strict_invalid_earlier_duplicate(void)
+{
+    /* The lenient parser drops the null before anything can look at it. */
+    const char *const text = "{\"vars\": {\"good\": null, \"good\": \"ok\"}}";
+
+    assert_strict_refused(text, JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+
+    const char *data = text;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    JsonElement *vars = JsonObjectGetAsObject(json, "vars");
+    assert_int_equal(1, JsonLength(vars));
+    assert_string_equal("ok", JsonObjectGetAsString(vars, "good"));
+    JsonDestroy(json);
+}
+
+static void test_parse_strict_repeated_section(void)
+{
+    const char *const text =
+        "{\"vars\": {\"a\": \"1\"}, \"classes\": {},"
+        " \"vars\": {\"b\": \"2\"}}";
+
+    assert_strict_refused(text, JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+
+    /* The lenient parser keeps only the last section. */
+    const char *data = text;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    JsonElement *vars = JsonObjectGetAsObject(json, "vars");
+    assert_true(JsonObjectGet(vars, "a") == NULL);
+    assert_string_equal("2", JsonObjectGetAsString(vars, "b"));
+    JsonDestroy(json);
+}
+
+static void test_parse_strict_trailing_characters(void)
+{
+    assert_strict_refused(
+        "{\"vars\": {}} not-json", JSON_PARSE_ERROR_INVALID_END);
+    assert_strict_refused("{} {}", JSON_PARSE_ERROR_INVALID_END);
+    assert_strict_refused("{}}", JSON_PARSE_ERROR_INVALID_END);
+    assert_strict_refused("{}\n\n x", JSON_PARSE_ERROR_INVALID_END);
+    assert_strict_refused("[] ,", JSON_PARSE_ERROR_INVALID_END);
+    assert_strict_refused("12 x", JSON_PARSE_ERROR_INVALID_END);
+    assert_strict_refused("true false", JSON_PARSE_ERROR_INVALID_END);
+    assert_strict_refused("null x", JSON_PARSE_ERROR_INVALID_END);
+    assert_strict_refused("\"s\" \"t\"", JSON_PARSE_ERROR_INVALID_END);
+
+    /* An ordinary syntax error is still its own error. */
+    assert_strict_refused("{\"a\": ", JSON_PARSE_ERROR_OBJECT_END);
+    assert_strict_refused("", JSON_PARSE_ERROR_NO_DATA);
+    assert_strict_refused("  \n", JSON_PARSE_ERROR_NO_DATA);
+
+    /* The lenient functions accept the valid prefix, as before. */
+    const char *data = "{\"vars\": {}} not-json";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    data = "{\"vars\": {}} not-json";
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END, JsonParseAll(&data, &json));
+    assert_true(json == NULL);
+}
+
+static void test_parse_lenient_duplicate_last_wins(void)
+{
+    const char *const text =
+        "{\"a\": \"1\", \"b\": {\"x\": 1, \"x\": 2}, \"a\": \"3\","
+        " c: 1, c: 4}";
+
+    const char *data = text;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_int_equal(3, JsonLength(json));
+    assert_string_equal("3", JsonObjectGetAsString(json, "a"));
+    assert_int_equal(1, JsonLength(JsonObjectGetAsObject(json, "b")));
+    JsonDestroy(json);
+
+    data = text;
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseAll(&data, &json));
+    assert_string_equal("3", JsonObjectGetAsString(json, "a"));
+    JsonDestroy(json);
+
+    data = text;
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_OK, JsonParseWithLookup(NULL, NULL, &data, &json));
+    assert_string_equal("3", JsonObjectGetAsString(json, "a"));
+    JsonDestroy(json);
+}
+
+static void test_parse_strict_error_string(void)
+{
+    const char *const message =
+        JsonParseErrorToString(JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+    assert_true(message != NULL);
+    assert_true(strstr(message, "duplicate") != NULL);
+
+    const char *const nul_msg =
+        JsonParseErrorToString(JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_true(nul_msg != NULL);
+    assert_true(strstr(nul_msg, "null") != NULL);
+
+    const char *const depth_msg =
+        JsonParseErrorToString(JSON_PARSE_ERROR_MAX_DEPTH);
+    assert_true(depth_msg != NULL);
+    assert_true(strstr(depth_msg, "depth") != NULL);
+
+    const char *const ctrl_msg =
+        JsonParseErrorToString(JSON_PARSE_ERROR_STRING_CONTROL_CHAR);
+    assert_true(ctrl_msg != NULL);
+    assert_true(strstr(ctrl_msg, "control") != NULL);
+
+    const char *const esc_msg =
+        JsonParseErrorToString(JSON_PARSE_ERROR_STRING_INVALID_ESCAPE);
+    assert_true(esc_msg != NULL);
+    assert_true(strstr(esc_msg, "escape") != NULL);
+
+    const char *const mem_msg =
+        JsonParseErrorToString(JSON_PARSE_ERROR_MAX_MEMBERS);
+    assert_true(mem_msg != NULL);
+    assert_true(strstr(mem_msg, "member") != NULL);
+
+    const char *const utf8_msg =
+        JsonParseErrorToString(JSON_PARSE_ERROR_STRING_INVALID_UTF8);
+    assert_true(utf8_msg != NULL);
+    assert_true(strstr(utf8_msg, "UTF-8") != NULL);
+}
+
+static void write_strict_test_file(
+    char *const filename, const char *const content, const size_t length)
+{
+    const int fd = mkstemp(filename);
+    assert_true(fd >= 0);
+    assert_int_equal(length, FullWrite(fd, content, length));
+    close(fd);
+}
+
+static JsonParseError strict_file(
+    const char *const content,
+    const size_t length,
+    const size_t size_max,
+    JsonElement **const json_out)
+{
+    char filename[] = "/tmp/json_test_strict_XXXXXX";
+    write_strict_test_file(filename, content, length);
+    const JsonParseError error =
+        JsonParseFileStrict(filename, size_max, json_out);
+    unlink(filename);
+    return error;
+}
+
+#define STRICT_FILE(text, size_max, json_out) \
+    strict_file(text, sizeof(text) - 1, size_max, json_out)
+
+static void test_parse_file_strict(void)
+{
+    JsonElement *json = NULL;
+    assert_int_equal(
+        JSON_PARSE_OK,
+        STRICT_FILE("{\"vars\": {\"a\": \"1\"}}\n", 1024, &json));
+    assert_string_equal(
+        "1", JsonObjectGetAsString(JsonObjectGetAsObject(json, "vars"), "a"));
+    JsonDestroy(json);
+
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY,
+        STRICT_FILE("{\"vars\": {\"a\": null, \"a\": \"1\"}}", 1024, &json));
+    assert_true(json == NULL);
+
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY,
+        STRICT_FILE("{\"vars\": {}, \"vars\": {}}", 1024, &json));
+    assert_true(json == NULL);
+
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        STRICT_FILE("{\"vars\": {}} not-json\n", 1024, &json));
+    assert_true(json == NULL);
+
+    /* A null byte must not hide what follows it from the parser. */
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        STRICT_FILE("{\"vars\": {}}\0not-json", 1024, &json));
+    assert_true(json == NULL);
+
+    /* The size cap is kept: a larger file is refused, not cut short. */
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_TRUNCATED,
+        STRICT_FILE("{\"vars\": {\"a\": \"1\"}}", 8, &json));
+    assert_true(json == NULL);
+
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_NO_SUCH_FILE,
+        JsonParseFileStrict("/nonexistent/json_test_strict", 1024, &json));
+    assert_true(json == NULL);
+
+    json = NULL;
+    assert_int_equal(JSON_PARSE_ERROR_NO_DATA, STRICT_FILE("", 1024, &json));
+    assert_true(json == NULL);
+}
+
+static void test_parse_file_lenient_unchanged(void)
+{
+    /* JsonParseFile() still repairs both, as before. */
+    char filename[] = "/tmp/json_test_lenient_XXXXXX";
+    const char content[] = "{\"a\": \"1\", \"a\": \"2\"} not-json\n";
+    write_strict_test_file(filename, content, sizeof(content) - 1);
+
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseFile(filename, 1024, &json));
+    assert_string_equal("2", JsonObjectGetAsString(json, "a"));
+    JsonDestroy(json);
+
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_OK, JsonParseAnyFile(filename, 1024, &json, false));
+    assert_string_equal("2", JsonObjectGetAsString(json, "a"));
+    JsonDestroy(json);
+
+    unlink(filename);
+}
+
+static void assert_raw_nul_file_refused(
+    const char *const content, const size_t length, const size_t size_max)
+{
+    char filename[] = "/tmp/json_test_rawnul_XXXXXX";
+    write_strict_test_file(filename, content, length);
+
+    JsonElement *json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        JsonParseFileStrict(filename, size_max, &json));
+    assert_true(json == NULL);
+
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        JsonParseFile(filename, size_max, &json));
+    assert_true(json == NULL);
+
+    json = JsonReadDataFile(
+        "json_test", filename, DATAFILETYPE_JSON, size_max, false);
+    assert_true(json == NULL);
+
+    unlink(filename);
+}
+
+static void assert_healthy_json_file_accepted(
+    const char *const content, const size_t length, const size_t size_max)
+{
+    char filename[] = "/tmp/json_test_healthy_XXXXXX";
+    write_strict_test_file(filename, content, length);
+
+    JsonElement *json = NULL;
+    assert_int_equal(
+        JSON_PARSE_OK, JsonParseFileStrict(filename, size_max, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseFile(filename, size_max, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    json = JsonReadDataFile(
+        "json_test", filename, DATAFILETYPE_JSON, size_max, false);
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    unlink(filename);
+}
+
+#ifndef __MINGW32__
+static JsonParseError parse_fifo_file(
+    const char *const fifo_path,
+    const char *const content,
+    const size_t length,
+    const size_t size_max,
+    JsonElement **const json_out)
+{
+    const pid_t pid = fork();
+    assert_true(pid >= 0);
+    if (pid == 0)
+    {
+        signal(SIGPIPE, SIG_IGN);
+        const int wfd = open(fifo_path, O_WRONLY);
+        if (wfd >= 0)
+        {
+            (void) FullWrite(wfd, content, length);
+            close(wfd);
+        }
+        _exit(0);
+    }
+
+    const JsonParseError err = JsonParseFile(fifo_path, size_max, json_out);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    {
+    }
+    return err;
+}
+#endif
+
+static void test_parse_file_raw_nul_boundaries(void)
+{
+    /* Trailing-NUL-only: {}\0 (7b 7d 00) and {}\n\0 (7b 7d 0a 00). */
+    static const char trailing_nul[] = { '{', '}', '\0' };
+    static const char trailing_lf_nul[] = { '{', '}', '\n', '\0' };
+    assert_raw_nul_file_refused(trailing_nul, sizeof(trailing_nul), 1024);
+    assert_raw_nul_file_refused(
+        trailing_lf_nul, sizeof(trailing_lf_nul), 1024);
+
+    /* Exact file_size == size_max with trailing NUL must still refuse. */
+    assert_raw_nul_file_refused(
+        trailing_nul, sizeof(trailing_nul), sizeof(trailing_nul));
+    assert_raw_nul_file_refused(
+        trailing_lf_nul, sizeof(trailing_lf_nul), sizeof(trailing_lf_nul));
+    assert_healthy_json_file_accepted("{}", 2, 2);
+
+    /* Leading-NUL: \0{} (00 7b 7d) must give INVALID_END, not NO_DATA. */
+    static const char leading_nul[] = { '\0', '{', '}' };
+    assert_raw_nul_file_refused(leading_nul, sizeof(leading_nul), 1024);
+
+    /* Mid-file NUL hiding trailing garbage. */
+    static const char mid_nul[] = "{\"vars\": {}}\0not-json";
+    assert_raw_nul_file_refused(mid_nul, sizeof(mid_nul) - 1, 1024);
+
+    /* YAML raw-NUL refusal via JsonParseAnyFile(..., true) and
+     * JsonReadDataFile(..., DATAFILETYPE_YAML, ...), independent of libyaml
+     * because NUL detection runs during reading before parsing. */
+    char yaml_file[] = "/tmp/json_test_yaml_nul_XXXXXX";
+    static const char yaml_nul[] = "a: 1\n\0b: 2\n";
+    write_strict_test_file(yaml_file, yaml_nul, sizeof(yaml_nul) - 1);
+    JsonElement *yaml_json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        JsonParseAnyFile(yaml_file, 1024, &yaml_json, true));
+    assert_true(yaml_json == NULL);
+    yaml_json = JsonReadDataFile(
+        "json_test", yaml_file, DATAFILETYPE_YAML, 1024, false);
+    assert_true(yaml_json == NULL);
+    unlink(yaml_file);
+
+#ifndef __MINGW32__
+    /* Non-regular file (FIFO / named pipe): raw NUL refused, valid JSON ok. */
+    char fifo_dir[] = "/tmp/json_test_fifo_XXXXXX";
+    assert_true(mkdtemp(fifo_dir) != NULL);
+    char fifo_path[128];
+    xsnprintf(fifo_path, sizeof(fifo_path), "%s/in.fifo", fifo_dir);
+    assert_int_equal(0, mkfifo(fifo_path, 0600));
+
+    static const char fifo_nul[] = "{\"ok\":true}\0garbage";
+    JsonElement *fifo_json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_INVALID_END,
+        parse_fifo_file(
+            fifo_path, fifo_nul, sizeof(fifo_nul) - 1, 1024, &fifo_json));
+    assert_true(fifo_json == NULL);
+
+    static const char fifo_ok[] = "{\"ok\":true}";
+    fifo_json = NULL;
+    assert_int_equal(
+        JSON_PARSE_OK,
+        parse_fifo_file(
+            fifo_path, fifo_ok, sizeof(fifo_ok) - 1, 1024, &fifo_json));
+    assert_true(fifo_json != NULL);
+    assert_true(JsonObjectGetAsBool(fifo_json, "ok"));
+    JsonDestroy(fifo_json);
+
+    unlink(fifo_path);
+    rmdir(fifo_dir);
+#endif
+
+    /* Chunk-boundary NUL: valid JSON padded past READ_BUFSIZE (> 8192 bytes)
+     * with a single 0x00 as its final byte. */
+    const size_t pad = 8192;
+    const size_t padded_len = pad + 2; /* 8192 spaces + "{}" */
+    char *padded = xmalloc(padded_len + 1);
+    memset(padded, ' ', pad);
+    padded[pad] = '{';
+    padded[pad + 1] = '}';
+    padded[padded_len] = '\0';
+
+    assert_raw_nul_file_refused(padded, padded_len + 1, 16384);
+    assert_healthy_json_file_accepted(padded, padded_len, 16384);
+    free(padded);
+
+    /* Also verify a large JSON string (> 8192 bytes) with trailing 0x00. */
+    const size_t str_pad = 8200;
+    const char *prefix = "{\"k\":\"";
+    const char *suffix = "\"}";
+    const size_t big_len = strlen(prefix) + str_pad + strlen(suffix);
+    char *big = xmalloc(big_len + 1);
+    memcpy(big, prefix, strlen(prefix));
+    memset(big + strlen(prefix), 'a', str_pad);
+    memcpy(big + strlen(prefix) + str_pad, suffix, strlen(suffix));
+    big[big_len] = '\0';
+
+    assert_raw_nul_file_refused(big, big_len + 1, 16384);
+    assert_healthy_json_file_accepted(big, big_len, 16384);
+    free(big);
+
+    /* Healthy controls: {} (7b 7d) and {}\n (7b 7d 0a). */
+    assert_healthy_json_file_accepted("{}", 2, 1024);
+    assert_healthy_json_file_accepted("{}\n", 3, 1024);
+
+    /* Lenient JsonParseFile() / JsonReadDataFile() still keep duplicate-last-wins,
+     * ignored trailing non-NUL input, and clean truncation handling. */
+    char filename[] = "/tmp/json_test_lenient_ctrl_XXXXXX";
+    const char lenient_doc[] = "{\"a\": \"1\", \"a\": \"2\"} trailing\n";
+    write_strict_test_file(filename, lenient_doc, sizeof(lenient_doc) - 1);
+
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseFile(filename, 1024, &json));
+    assert_true(json != NULL);
+    assert_string_equal("2", JsonObjectGetAsString(json, "a"));
+    JsonDestroy(json);
+
+    json = JsonReadDataFile(
+        "json_test", filename, DATAFILETYPE_JSON, 1024, false);
+    assert_true(json != NULL);
+    assert_string_equal("2", JsonObjectGetAsString(json, "a"));
+    JsonDestroy(json);
+
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_TRUNCATED, JsonParseFile(filename, 8, &json));
+    assert_true(json == NULL);
+
+    unlink(filename);
+}
+
 static void test_detach_key_from_object(void)
 {
     JsonElement *object = JsonObjectCreate(3);
@@ -1873,6 +3158,276 @@ static void test_string_escape(void)
     const char escaped_invalid_hex[] = {
         'B', 'l', 'a', 'h', '\\', '\\', 'u', '0', 'z', '1', 'b', '\0'};
     assert_json_strings_eq(unescaped_invalid_hex, escaped_invalid_hex);
+}
+
+#define assert_encodes_to(input, expected)         \
+    {                                              \
+        char *const out = JsonEncodeString(input); \
+        assert_string_equal(out, expected);        \
+        free(out);                                 \
+    }
+
+#define assert_decodes_to(input, expected)         \
+    {                                              \
+        char *const out = JsonDecodeString(input); \
+        assert_string_equal(out, expected);        \
+        free(out);                                 \
+    }
+
+/* The expectations below are hard-coded rather than round-tripped through
+ * libntech's own codec on purpose: the encoder and decoder used to be exact
+ * inverses of each other's non-conformance (CFE-4730), so a write-then-read
+ * test passed even on broken code.  Every expected value was derived from a
+ * known conformant implementation, e.g.:
+ *
+ *   $ python3 -c "import json; print(json.dumps('\u4e2d\u56fd'))"
+ *   "\u4e2d\u56fd"
+ *   $ python3 -c "print('\u4e2d\u56fd'.encode('utf-8').hex())"
+ *   e4b8ade59bbd
+ */
+static void test_string_encode_unicode(void)
+{
+    /* Valid UTF-8 is written as-is (RFC 8259 section 7 allows it; the
+     * fix/json-encode-raw-utf8 branch chose it over code-point escapes so
+     * other parsers read "café" and not "cafÃ©").  See also
+     * test_string_escape_utf8(). */
+    // U+4E2D U+56FD (Chinese "zhongguo"), UTF-8 e4 b8 ad e5 9b bd
+    assert_encodes_to("\xe4\xb8\xad\xe5\x9b\xbd", "\xe4\xb8\xad\xe5\x9b\xbd");
+
+    // U+00E9 (e with acute accent), UTF-8 c3 a9
+    assert_encodes_to("caf\xc3\xa9", "caf\xc3\xa9");
+
+    // U+1F600 (emoji), UTF-8 f0 9f 98 80: outside the Basic Multilingual
+    // Plane, still written as-is
+    assert_encodes_to("\xf0\x9f\x98\x80", "\xf0\x9f\x98\x80");
+
+    // UTF-8 sequence length boundaries: DEL is not printable ASCII and is
+    // escaped; every valid multi-byte sequence passes through
+    assert_encodes_to("\x7f", "\\u007f");                     // U+007F
+    assert_encodes_to("\xc2\x80", "\xc2\x80");                 // U+0080
+    assert_encodes_to("\xdf\xbf", "\xdf\xbf");                 // U+07FF
+    assert_encodes_to("\xe0\xa0\x80", "\xe0\xa0\x80");         // U+0800
+    assert_encodes_to("\xef\xbf\xbf", "\xef\xbf\xbf");         // U+FFFF
+    assert_encodes_to("\xf0\x90\x80\x80", "\xf0\x90\x80\x80"); // U+10000
+    assert_encodes_to("\xf4\x8f\xbf\xbf", "\xf4\x8f\xbf\xbf"); // U+10FFFF
+
+    // the escapes JSON requires are unaffected
+    assert_encodes_to("say \"hi\"", "say \\\"hi\\\"");
+    assert_encodes_to("a\\b", "a\\\\b");
+    assert_encodes_to("\x01\x1f", "\\u0001\\u001f");
+
+    /* Input that is not valid UTF-8 has no faithful representation in a
+     * JSON string; each such byte is escaped by value.  A conformant
+     * reader decodes \u00e9 as U+00E9 (c3 a9), not as the byte e9 -
+     * inherent, since JSON strings carry Unicode code points, not bytes. */
+    assert_encodes_to("\x80", "\\u0080");         // stray continuation byte
+    assert_encodes_to("\xe9x", "\\u00e9x");       // lead byte, no continuation
+    assert_encodes_to("caf\xc3", "caf\\u00c3");   // truncated at end of string
+    assert_encodes_to("\xc0\xaf", "\\u00c0\\u00af"); // overlong encoding
+    // CESU-8 style encoded UTF-16 surrogate is not valid UTF-8 either:
+    assert_encodes_to("\xed\xa0\x80", "\\u00ed\\u00a0\\u0080");
+    assert_encodes_to("\xf5\x80", "\\u00f5\\u0080"); // beyond U+10FFFF
+}
+
+static void test_string_decode_unicode(void)
+{
+    // python3 -c "print('\u4e2d\u56fd'.encode('utf-8').hex())" -> e4b8ade59bbd
+    assert_decodes_to("\\u4e2d\\u56fd", "\xe4\xb8\xad\xe5\x9b\xbd");
+    assert_decodes_to("\\u4E2D", "\xe4\xb8\xad"); // upper-case hex digits
+    assert_decodes_to("caf\\u00e9", "caf\xc3\xa9");
+    assert_decodes_to("\\u0041", "A");
+
+    // surrogate pair -> U+1F600, UTF-8 f0 9f 98 80
+    assert_decodes_to("\\ud83d\\ude00", "\xf0\x9f\x98\x80");
+
+    // UTF-8 sequence length boundaries
+    assert_decodes_to("\\u007f", "\x7f");
+    assert_decodes_to("\\u0080", "\xc2\x80");
+    assert_decodes_to("\\u07ff", "\xdf\xbf");
+    assert_decodes_to("\\u0800", "\xe0\xa0\x80");
+    assert_decodes_to("\\uffff", "\xef\xbf\xbf");
+
+    /* An unpaired surrogate denotes no character; it becomes U+FFFD
+     * REPLACEMENT CHARACTER (UTF-8 ef bf bd) instead of being corrupted
+     * into literal text. */
+    assert_decodes_to("\\ud83d", "\xef\xbf\xbd");   // lone high surrogate
+    assert_decodes_to("\\ude00", "\xef\xbf\xbd");   // lone low surrogate
+    assert_decodes_to("a\\ud83dz", "a\xef\xbf\xbd" "z");
+    assert_decodes_to("\\ud83d\\u0041", "\xef\xbf\xbd" "A");
+    assert_decodes_to("\\ud800\\ud800", "\xef\xbf\xbd" "\xef\xbf\xbd");
+    assert_decodes_to("\\uDC00\\uD800", "\xef\xbf\xbd" "\xef\xbf\xbd");
+
+    /* Escaped U+0000 becomes U+FFFD instead of truncating the C string. */
+    assert_decodes_to("\\u0000", "\xef\xbf\xbd");
+    assert_decodes_to("safe\\u0000hidden", "safe\xef\xbf\xbd" "hidden");
+    assert_decodes_to("vars\\u0000x", "vars\xef\xbf\xbd" "x");
+
+    /* A \u escape not followed by four hex digits is malformed JSON; the
+     * "\u" introducer becomes U+FFFD and the characters after it, which
+     * were never a valid escape, are kept as-is. */
+    assert_decodes_to("\\u", "\xef\xbf\xbd");
+    assert_decodes_to("ab\\u12", "ab\xef\xbf\xbd" "12");
+    assert_decodes_to("\\u12zz", "\xef\xbf\xbd" "12zz");
+
+    // ordinary escapes still work alongside \u escapes
+    assert_decodes_to("\\t\\u4e2d", "\t\xe4\xb8\xad");
+}
+
+static void test_parse_unicode_strings(void)
+{
+    {
+        // \uXXXX escapes in parsed documents must decode to UTF-8
+        const char *data =
+            "{\"city\": \"\\u4e2d\\u56fd\","
+            " \"cafe\": \"caf\\u00e9\","
+            " \"emoji\": \"\\ud83d\\ude00\"}";
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+        assert_string_equal(
+            JsonObjectGetAsString(json, "city"), "\xe4\xb8\xad\xe5\x9b\xbd");
+        assert_string_equal(
+            JsonObjectGetAsString(json, "cafe"), "caf\xc3\xa9");
+        assert_string_equal(
+            JsonObjectGetAsString(json, "emoji"), "\xf0\x9f\x98\x80");
+        JsonDestroy(json);
+    }
+
+    {
+        // raw UTF-8 in a parsed document passes through unmodified
+        const char *data = "{\"city\": \"\xe4\xb8\xad\xe5\x9b\xbd\"}";
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+        assert_string_equal(
+            JsonObjectGetAsString(json, "city"), "\xe4\xb8\xad\xe5\x9b\xbd");
+        JsonDestroy(json);
+    }
+}
+
+static void assert_lenient_parse_string_both(
+    const char *const json_text, const char *const expected)
+{
+    const char *data = json_text;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_string_equal(expected, JsonPrimitiveGetAsString(json));
+    JsonDestroy(json);
+
+    char filename[] = "/tmp/json_test_lenient_esc_XXXXXX";
+    write_strict_test_file(filename, json_text, strlen(json_text));
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseFile(filename, 1024, &json));
+    unlink(filename);
+    assert_true(json != NULL);
+    assert_string_equal(expected, JsonPrimitiveGetAsString(json));
+    JsonDestroy(json);
+}
+
+static void test_parse_lenient_escapes_and_null_repair(void)
+{
+    /* Escaped U+0000 becomes U+FFFD (ef bf bd) with following text preserved
+     * across JsonParse() and JsonParseFile() in values and member names. */
+    assert_lenient_parse_string_both("\"\\u0000\"", "\xef\xbf\xbd");
+    assert_lenient_parse_string_both(
+        "\"safe\\u0000hidden\"", "safe\xef\xbf\xbd" "hidden");
+
+    const char *const obj_doc =
+        "{\"vars\\u0000x\": \"safe\\u0000hidden\"}";
+    const char *data = obj_doc;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_true(JsonObjectGet(json, "vars") == NULL);
+    assert_string_equal(
+        "safe\xef\xbf\xbd" "hidden",
+        JsonObjectGetAsString(json, "vars\xef\xbf\xbd" "x"));
+    JsonDestroy(json);
+
+    char filename[] = "/tmp/json_test_lenient_nul_XXXXXX";
+    write_strict_test_file(filename, obj_doc, strlen(obj_doc));
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseFile(filename, 1024, &json));
+    assert_true(json != NULL);
+    assert_true(JsonObjectGet(json, "vars") == NULL);
+    assert_string_equal(
+        "safe\xef\xbf\xbd" "hidden",
+        JsonObjectGetAsString(json, "vars\xef\xbf\xbd" "x"));
+    JsonDestroy(json);
+
+    /* Strict mode still refuses escaped U+0000 on the same file. */
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_STRING_NULL_ESCAPE,
+        JsonParseFileStrict(filename, 1024, &json));
+    assert_true(json == NULL);
+    unlink(filename);
+
+    /* Declared legacy U+FFFD repair on JsonParse() and JsonParseFile():
+     * malformed \u, lone high/low surrogates, reversed surrogate pair,
+     * high-high surrogate, and unknown escapes kept verbatim. */
+    assert_lenient_parse_string_both("\"\\u\"", "\xef\xbf\xbd");
+    assert_lenient_parse_string_both("\"ab\\u12\"", "ab\xef\xbf\xbd" "12");
+    assert_lenient_parse_string_both("\"\\u12zz\"", "\xef\xbf\xbd" "12zz");
+    assert_lenient_parse_string_both(
+        "\"a\\ud83dz\"", "a\xef\xbf\xbd" "z");
+    assert_lenient_parse_string_both(
+        "\"a\\ude00z\"", "a\xef\xbf\xbd" "z");
+    assert_lenient_parse_string_both(
+        "\"\\ud83d\\u0041\"", "\xef\xbf\xbd" "A");
+    assert_lenient_parse_string_both(
+        "\"\\uDC00\\uD800\"", "\xef\xbf\xbd" "\xef\xbf\xbd");
+    assert_lenient_parse_string_both(
+        "\"\\ud800\\ud800\"", "\xef\xbf\xbd" "\xef\xbf\xbd");
+    assert_lenient_parse_string_both("\"a\\qb\"", "a\\qb");
+    assert_lenient_parse_string_both("\"\\x41\"", "\\x41");
+}
+
+static void test_string_escape_utf8(void)
+{
+    // Valid UTF-8 is written as-is (RFC 8259 section 7)
+    assert_json_strings_eq("caf\xc3\xa9", "caf\xc3\xa9");
+    assert_json_strings_eq("\xe4\xb8\xad", "\xe4\xb8\xad");
+    assert_json_strings_eq("\xf0\x9f\x98\x80", "\xf0\x9f\x98\x80");
+
+    /* Anything else is still escaped byte by byte: invalid, truncated,
+     * overlong, surrogate, beyond U+10FFFF, and control characters.  Encode
+     * only: the conformant decoder (CFE-4730) reads \u00XX as U+00XX, not as
+     * the byte 0xXX, so these do not round-trip (see below). */
+    assert_encodes_to("\xe9", "\\u00e9");
+    assert_encodes_to("\xe4\xb8" "x", "\\u00e4\\u00b8x");
+    assert_encodes_to("\xf0\x9f\x98", "\\u00f0\\u009f\\u0098");
+    assert_encodes_to("\xc0\xaf", "\\u00c0\\u00af");
+    assert_encodes_to("\xed\xa0\x80", "\\u00ed\\u00a0\\u0080");
+    assert_encodes_to("\xf4\x90\x80\x80", "\\u00f4\\u0090\\u0080\\u0080");
+    assert_json_strings_eq("\x01\x7f", "\\u0001\\u007f");
+
+    /* Valid UTF-8 round-trips unchanged.  Bytes that are not valid UTF-8
+     * do not: \u00e9 denotes U+00E9, so the conformant decoder (CFE-4730)
+     * reads it back as c3 a9, not as the byte e9 it was written for. */
+    const char *const inputs[] = {
+        "caf\xc3\xa9",
+        "\xe4\xb8\xad \xf0\x9f\x98\x80",
+        "\xe9 \xe4\xb8 \xc0\xaf \xed\xa0\x80 \x01",
+    };
+    const char *const expected[] = {
+        "caf\xc3\xa9",
+        "\xe4\xb8\xad \xf0\x9f\x98\x80",
+        "\xc3\xa9 \xc3\xa4\xc2\xb8 \xc3\x80\xc2\xaf \xc3\xad\xc2\xa0\xc2\x80 \x01",
+    };
+    for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++)
+    {
+        JsonElement *const str = JsonStringCreate(inputs[i]);
+        char *const written = JsonToString(str);
+        JsonDestroy(str);
+
+        const char *data = written;
+        JsonElement *json = NULL;
+        assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+        assert_string_equal(expected[i], JsonPrimitiveGetAsString(json));
+
+        JsonDestroy(json);
+        free(written);
+    }
 }
 
 #define assert_json5_data_eq(_size, unescaped, escaped)           \
@@ -2487,10 +4042,108 @@ static void test_json_parse_object_missing_comma(void)
     }
 }
 
+static void test_real_renders_as_parsed(void)
+{
+    // Going through double and StringFromDouble() formatted with "%.2f",
+    // so anything with more than two decimals rendered as a wrong value
+    // rather than a rounded one.
+    CheckRealRendersAsParsed("0.00049");
+    CheckRealRendersAsParsed("3.14159265");
+    CheckRealRendersAsParsed("1234.1234");
+    CheckRealRendersAsParsed("-0.001");
+
+    // Two decimals or fewer were still reformatted: "0.5" came back "0.50",
+    // which disagrees with JsonWriteCompact() on the same element.
+    CheckRealRendersAsParsed("0.5");
+    CheckRealRendersAsParsed("0.25");
+
+    // Exponent forms are not covered here: a number written with an
+    // exponent and no decimal point is still classified as an integer at
+    // this point, so it does not reach this path yet.
+}
+
+static void test_real_created_in_memory_renders_as_stored(void)
+{
+    // Every case above starts from a parsed lexeme. A real built in memory
+    // renders from a different string: JsonRealCreate() stores its argument
+    // with "%.4f", so rendering must return that stored text rather than
+    // reformatting the value a second time. This used to render as "0.50",
+    // disagreeing with JsonWriteCompact() on the same element.
+    JsonElement *json = JsonRealCreate(0.5);
+    assert_int_equal(JSON_PRIMITIVE_TYPE_REAL, JsonGetPrimitiveType(json));
+
+    char *str = JsonPrimitiveToString(json);
+    assert_string_equal("0.5000", str);
+    free(str);
+
+    Writer *writer = StringWriter();
+    JsonWriteCompact(writer, json);
+    char *output = StringWriterClose(writer);
+    assert_string_equal("0.5000", output);
+    free(output);
+
+    JsonDestroy(json);
+}
+
+static void test_parse_string_trailing_backslash(void)
+{
+    /* Exact-sized heap buffers so ASan catches any read past the NUL. */
+    const char *const cases[] = {
+        "\"x\\",
+        "\"\\",
+        "{\"a\": \"x\\",
+        "{\"x\\",
+        "[\"x\\",
+        NULL
+    };
+
+    for (size_t i = 0; cases[i] != NULL; i++)
+    {
+        const size_t len = strlen(cases[i]);
+        char *buf = xmalloc(len + 1);
+        memcpy(buf, cases[i], len + 1);
+
+        const char *data = buf;
+        JsonElement *json = NULL;
+        assert_int_equal(
+            JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END,
+            JsonParse(&data, &json));
+        assert_true(json == NULL);
+
+        free(buf);
+    }
+
+    /* Escaped trailing backslash before the closing quote still parses. */
+    const char *valid = "\"x\\\\\"";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&valid, &json));
+    assert_true(json != NULL);
+    assert_string_equal("x\\", JsonPrimitiveGetAsString(json));
+    JsonDestroy(json);
+}
+
 int main()
 {
     PRINT_TEST_BANNER();
     const UnitTest tests[] = {
+        unit_test(test_parse_strict_valid),
+        unit_test(test_parse_strict_duplicate_member),
+        unit_test(test_parse_strict_non_json_forms),
+        unit_test(test_parse_strict_commas_and_array_separators),
+        unit_test(test_parse_strict_control_chars_and_escapes),
+        unit_test(test_parse_strict_negative_leading_zero),
+        unit_test(test_parse_strict_utf8),
+        unit_test(test_parse_strict_max_members),
+        unit_test(test_parse_strict_large_object_linear),
+        unit_test(test_parse_strict_max_depth),
+        unit_test(test_parse_strict_invalid_earlier_duplicate),
+        unit_test(test_parse_strict_repeated_section),
+        unit_test(test_parse_strict_trailing_characters),
+        unit_test(test_parse_lenient_duplicate_last_wins),
+        unit_test(test_parse_strict_error_string),
+        unit_test(test_parse_file_strict),
+        unit_test(test_parse_file_lenient_unchanged),
+        unit_test(test_parse_file_raw_nul_boundaries),
         unit_test(test_array_get_string),
         unit_test(test_array_iterator),
         unit_test(test_array_remove_range),
@@ -2522,8 +4175,11 @@ int main()
         unit_test(test_parse_empty_containers),
         unit_test(test_parse_empty_string),
         unit_test(test_parse_escaped_string),
+        unit_test(test_parse_string_not_double_decoded),
+        unit_test(test_parse_object_key_unicode_escape),
         unit_test(test_parse_big_numbers),
         unit_test(test_parse_good_numbers),
+        unit_test(test_parse_exponent_numbers),
         unit_test(test_parse_object_compound),
         unit_test(test_parse_object_diverse),
         unit_test(test_parse_object_double_and_trailing_comma),
@@ -2554,12 +4210,28 @@ int main()
         unit_test(test_show_object_simple),
         unit_test(test_show_string),
         unit_test(test_string_escape),
+        unit_test(test_string_encode_unicode),
+        unit_test(test_string_decode_unicode),
+        unit_test(test_parse_unicode_strings),
+        unit_test(test_parse_lenient_escapes_and_null_repair),
+        unit_test(test_string_escape_utf8),
         unit_test(test_string_escape_json5),
         unit_test(test_json_null_not_null),
         unit_test(test_json_object_merge_deep),
         unit_test(test_compare_container_type_mismatch),
         unit_test(test_json_get_type_as_string),
         unit_test(test_json_parse_object_missing_comma),
+        unit_test(test_parse_string_trailing_backslash),
+        unit_test(test_real_renders_as_parsed),
+        unit_test(test_real_created_in_memory_renders_as_stored),
+
+        /* Tests whose subject is the conversion that exits the process are
+         * registered last. A regression in any of them terminates the whole
+         * binary at that point, so anything after them would report nothing;
+         * the tests that fail by assertion run first and say more. */
+        unit_test(test_primitive_to_string_numbers),
+        unit_test(test_copy_preserves_numbers),
+        unit_test(test_select_oversized_array_index),
     };
 
     return run_tests(tests);
