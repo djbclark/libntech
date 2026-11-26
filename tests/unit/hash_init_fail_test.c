@@ -191,7 +191,12 @@ int main()
     {
         puts("hash_init_fail_test: could not force digest initialization"
              " failure in this environment; tests will pass vacuously");
+        fflush(stdout);
+        return 77;
     }
+    puts("hash_init_fail_test: forced digest initialization failure verified"
+         " (EVP_DigestInit_ex != 1)");
+    fflush(stdout);
     const UnitTest tests[] =
     {
         unit_test(test_HashNew_returns_NULL_on_init_failure),
