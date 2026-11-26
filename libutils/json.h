@@ -121,6 +121,10 @@ typedef enum
     JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY,
     JSON_PARSE_ERROR_STRING_NULL_ESCAPE,
     JSON_PARSE_ERROR_MAX_DEPTH,
+    JSON_PARSE_ERROR_STRING_CONTROL_CHAR,
+    JSON_PARSE_ERROR_STRING_INVALID_ESCAPE,
+    JSON_PARSE_ERROR_MAX_MEMBERS,
+    JSON_PARSE_ERROR_STRING_INVALID_UTF8,
 
     JSON_PARSE_ERROR_MAX
 } JsonParseError;
@@ -617,12 +621,20 @@ JsonParseError JsonParseAll(const char **data, JsonElement **json_out);
         member is replaced, rather than silently keeping the last one.
         Unquoted object keys are refused with
         JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL, missing colons with
-        JSON_PARSE_ERROR_OBJECT_COLON, \u0000 escapes with
-        JSON_PARSE_ERROR_STRING_NULL_ESCAPE, nesting deeper than 128 levels
-        with JSON_PARSE_ERROR_MAX_DEPTH, and trailing non-whitespace
-        characters with JSON_PARSE_ERROR_INVALID_END. Names are compared as
-        the parser decodes them, which is the comparison JsonObjectGet()
-        makes, so no member is ever replaced.
+        JSON_PARSE_ERROR_OBJECT_COLON, leading/trailing commas and missing
+        array commas with JSON_PARSE_ERROR_OBJECT_COMMA /
+        JSON_PARSE_ERROR_ARRAY_COMMA, raw control characters (0x01-0x1f)
+        with JSON_PARSE_ERROR_STRING_CONTROL_CHAR, invalid UTF-8 byte
+        sequences with JSON_PARSE_ERROR_STRING_INVALID_UTF8, unrecognized
+        escapes and malformed \u / unpaired surrogates with
+        JSON_PARSE_ERROR_STRING_INVALID_ESCAPE, \u0000 escapes with
+        JSON_PARSE_ERROR_STRING_NULL_ESCAPE, leading zeros after unary minus
+        (-00, -01) with JSON_PARSE_ERROR_NUMBER_*, nesting deeper than 128
+        levels with JSON_PARSE_ERROR_MAX_DEPTH, objects exceeding 65536
+        members with JSON_PARSE_ERROR_MAX_MEMBERS, and trailing
+        non-whitespace characters with JSON_PARSE_ERROR_INVALID_END. Names
+        are compared as the parser decodes them, which is the comparison
+        JsonObjectGet() makes, so no member is ever replaced.
   @returns See JsonParseError and JsonParseErrorToString
   */
 JsonParseError JsonParseStrict(const char **data, JsonElement **json_out);
