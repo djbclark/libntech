@@ -2211,6 +2211,12 @@ static JsonParseError JsonParseAsString(
 
         case '\\':
             *data = *data + 1;
+            if (**data == '\0')
+            {
+                WriterClose(writer);
+                *str_out = NULL;
+                return JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END;
+            }
             switch (**data)
             {
             case '\\':
@@ -2475,6 +2481,8 @@ static JsonParseError JsonParseAsArray(
             JsonParseError err = JsonParseAsString(data, &value);
             if (err != JSON_PARSE_OK)
             {
+                *json_out = NULL;
+                JsonDestroy(array);
                 return err;
             }
             JsonArrayAppendElement(
