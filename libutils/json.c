@@ -1383,6 +1383,13 @@ static void JsonDecodeStringWriter(
                         c);
                     codepoint = 0xfffd;
                 }
+                else if (codepoint == 0)
+                {
+                    Log(LOG_LEVEL_DEBUG,
+                        "Replacing JSON null escape '%.6s' with U+FFFD",
+                        c);
+                    codepoint = 0xfffd;
+                }
 
                 Utf8EncodeCodePointWriter(codepoint, w);
                 c += consumed;
@@ -2769,6 +2776,13 @@ static JsonParseError JsonParseAsString(
                 {
                     Log(LOG_LEVEL_DEBUG,
                         "Replacing unpaired JSON surrogate escape '%.6s' with U+FFFD",
+                        u - 1);
+                    codepoint = 0xfffd;
+                }
+                else if (codepoint == 0)
+                {
+                    Log(LOG_LEVEL_DEBUG,
+                        "Replacing JSON null escape '%.6s' with U+FFFD",
                         u - 1);
                     codepoint = 0xfffd;
                 }

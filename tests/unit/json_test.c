@@ -3039,6 +3039,12 @@ static void test_string_decode_unicode(void)
     assert_decodes_to("a\\ud83dz", "a\xef\xbf\xbd" "z");
     assert_decodes_to("\\ud83d\\u0041", "\xef\xbf\xbd" "A");
     assert_decodes_to("\\ud800\\ud800", "\xef\xbf\xbd" "\xef\xbf\xbd");
+    assert_decodes_to("\\uDC00\\uD800", "\xef\xbf\xbd" "\xef\xbf\xbd");
+
+    /* Escaped U+0000 becomes U+FFFD instead of truncating the C string. */
+    assert_decodes_to("\\u0000", "\xef\xbf\xbd");
+    assert_decodes_to("safe\\u0000hidden", "safe\xef\xbf\xbd" "hidden");
+    assert_decodes_to("vars\\u0000x", "vars\xef\xbf\xbd" "x");
 
     /* A \u escape not followed by four hex digits is malformed JSON; the
      * "\u" introducer becomes U+FFFD and the characters after it, which
@@ -3079,6 +3085,85 @@ static void test_parse_unicode_strings(void)
             JsonObjectGetAsString(json, "city"), "\xe4\xb8\xad\xe5\x9b\xbd");
         JsonDestroy(json);
     }
+}
+
+static void assert_lenient_parse_string_both(
+    const char *const json_text, const char *const expected)
+{
+    const char *data = json_text;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_string_equal(expected, JsonPrimitiveGetAsString(json));
+    JsonDestroy(json);
+
+    char filename[] = "/tmp/json_test_lenient_esc_XXXXXX";
+    write_strict_test_file(filename, json_text, strlen(json_text));
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseFile(filename, 1024, &json));
+    unlink(filename);
+    assert_true(json != NULL);
+    assert_string_equal(expected, JsonPrimitiveGetAsString(json));
+    JsonDestroy(json);
+}
+
+static void test_parse_lenient_escapes_and_null_repair(void)
+{
+    /* Escaped U+0000 becomes U+FFFD (ef bf bd) with following text preserved
+     * across JsonParse() and JsonParseFile() in values and member names. */
+    assert_lenient_parse_string_both("\"\\u0000\"", "\xef\xbf\xbd");
+    assert_lenient_parse_string_both(
+        "\"safe\\u0000hidden\"", "safe\xef\xbf\xbd" "hidden");
+
+    const char *const obj_doc =
+        "{\"vars\\u0000x\": \"safe\\u0000hidden\"}";
+    const char *data = obj_doc;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    assert_true(JsonObjectGet(json, "vars") == NULL);
+    assert_string_equal(
+        "safe\xef\xbf\xbd" "hidden",
+        JsonObjectGetAsString(json, "vars\xef\xbf\xbd" "x"));
+    JsonDestroy(json);
+
+    char filename[] = "/tmp/json_test_lenient_nul_XXXXXX";
+    write_strict_test_file(filename, obj_doc, strlen(obj_doc));
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseFile(filename, 1024, &json));
+    assert_true(json != NULL);
+    assert_true(JsonObjectGet(json, "vars") == NULL);
+    assert_string_equal(
+        "safe\xef\xbf\xbd" "hidden",
+        JsonObjectGetAsString(json, "vars\xef\xbf\xbd" "x"));
+    JsonDestroy(json);
+
+    /* Strict mode still refuses escaped U+0000 on the same file. */
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_STRING_NULL_ESCAPE,
+        JsonParseFileStrict(filename, 1024, &json));
+    assert_true(json == NULL);
+    unlink(filename);
+
+    /* Declared legacy U+FFFD repair on JsonParse() and JsonParseFile():
+     * malformed \u, lone high/low surrogates, reversed surrogate pair,
+     * high-high surrogate, and unknown escapes kept verbatim. */
+    assert_lenient_parse_string_both("\"\\u\"", "\xef\xbf\xbd");
+    assert_lenient_parse_string_both("\"ab\\u12\"", "ab\xef\xbf\xbd" "12");
+    assert_lenient_parse_string_both("\"\\u12zz\"", "\xef\xbf\xbd" "12zz");
+    assert_lenient_parse_string_both(
+        "\"a\\ud83dz\"", "a\xef\xbf\xbd" "z");
+    assert_lenient_parse_string_both(
+        "\"a\\ude00z\"", "a\xef\xbf\xbd" "z");
+    assert_lenient_parse_string_both(
+        "\"\\ud83d\\u0041\"", "\xef\xbf\xbd" "A");
+    assert_lenient_parse_string_both(
+        "\"\\uDC00\\uD800\"", "\xef\xbf\xbd" "\xef\xbf\xbd");
+    assert_lenient_parse_string_both(
+        "\"\\ud800\\ud800\"", "\xef\xbf\xbd" "\xef\xbf\xbd");
+    assert_lenient_parse_string_both("\"a\\qb\"", "a\\qb");
+    assert_lenient_parse_string_both("\"\\x41\"", "\\x41");
 }
 
 static void test_string_escape_utf8(void)
@@ -3911,6 +3996,7 @@ int main()
         unit_test(test_string_encode_unicode),
         unit_test(test_string_decode_unicode),
         unit_test(test_parse_unicode_strings),
+        unit_test(test_parse_lenient_escapes_and_null_repair),
         unit_test(test_string_escape_utf8),
         unit_test(test_string_escape_json5),
         unit_test(test_json_null_not_null),
