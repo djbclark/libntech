@@ -119,6 +119,8 @@ typedef enum
     JSON_PARSE_ERROR_NO_DATA,
     JSON_PARSE_ERROR_TRUNCATED,
     JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY,
+    JSON_PARSE_ERROR_STRING_NULL_ESCAPE,
+    JSON_PARSE_ERROR_MAX_DEPTH,
 
     JSON_PARSE_ERROR_MAX
 } JsonParseError;
@@ -613,10 +615,14 @@ JsonParseError JsonParseAll(const char **data, JsonElement **json_out);
         members of the same name in one object, at any depth, is refused
         with JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY before the earlier
         member is replaced, rather than silently keeping the last one.
-        As in JsonParseAll(), trailing non-whitespace characters are refused
-        with JSON_PARSE_ERROR_INVALID_END. Names are compared as the parser
-        decodes them, which is the comparison JsonObjectGet() makes, so no
-        member is ever replaced.
+        Unquoted object keys are refused with
+        JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL, missing colons with
+        JSON_PARSE_ERROR_OBJECT_COLON, \u0000 escapes with
+        JSON_PARSE_ERROR_STRING_NULL_ESCAPE, nesting deeper than 128 levels
+        with JSON_PARSE_ERROR_MAX_DEPTH, and trailing non-whitespace
+        characters with JSON_PARSE_ERROR_INVALID_END. Names are compared as
+        the parser decodes them, which is the comparison JsonObjectGet()
+        makes, so no member is ever replaced.
   @returns See JsonParseError and JsonParseErrorToString
   */
 JsonParseError JsonParseStrict(const char **data, JsonElement **json_out);

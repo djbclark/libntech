@@ -1934,7 +1934,7 @@ static void test_parse_strict_valid(void)
     const char *data =
         "{\"vars\": {\"a\": \"1\", \"b\": null},"
         " \"list\": [{\"k\": 1}, {\"k\": 2}, [{\"k\": 3}]],"
-        " \"other\": {\"a\": \"2\"}, plain: true}";
+        " \"other\": {\"a\": \"2\"}, \"plain\": true}";
     JsonElement *json = NULL;
     assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
     assert_true(json != NULL);
@@ -1970,8 +1970,7 @@ static void test_parse_strict_valid(void)
 
 static void test_parse_strict_duplicate_member(void)
 {
-    /* Top level, nested, in an object inside an array, unquoted names, and
-     * a quoted name against an unquoted one. */
+    /* Top level, nested, and in an object inside an array. */
     assert_strict_refused(
         "{\"a\": \"1\", \"a\": \"2\"}",
         JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
@@ -1984,10 +1983,6 @@ static void test_parse_strict_duplicate_member(void)
     assert_strict_refused(
         "[[{\"a\": {\"b\": [], \"b\": []}}]]",
         JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
-    assert_strict_refused(
-        "{a: 1, a: 2}", JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
-    assert_strict_refused(
-        "{a: 1, \"a\": 2}", JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
 
     /* Whatever the value types, however far apart the two are. */
     assert_strict_refused(
@@ -1995,6 +1990,165 @@ static void test_parse_strict_duplicate_member(void)
         JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
     assert_strict_refused(
         "{\"a\": true, \"a\": true}", JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
+}
+
+static void test_parse_strict_non_json_forms(void)
+{
+    /* Unquoted object keys are refused in strict mode. */
+    assert_strict_refused("{a: 1}", JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL);
+    assert_strict_refused("{plain: true}", JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL);
+    assert_strict_refused(
+        "{\"ok\": 1, bad: 2}", JSON_PARSE_ERROR_OBJECT_BAD_SYMBOL);
+
+    /* Missing colons between object key and value are refused. */
+    assert_strict_refused("{\"a\" \"b\"}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" 1}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" []}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" {}}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" true}", JSON_PARSE_ERROR_OBJECT_COLON);
+    assert_strict_refused("{\"a\" null}", JSON_PARSE_ERROR_OBJECT_COLON);
+
+    /* \u0000 escapes are refused in strict mode (keys, values, arrays, top). */
+    assert_strict_refused(
+        "\"a\\u0000b\"", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_strict_refused(
+        "{\"a\\u0000b\": 1}", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_strict_refused(
+        "{\"a\": \"x\\u0000y\"}", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_strict_refused(
+        "[\"\\u0000\"]", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_strict_refused(
+        "\"\\\\\\u0000\"", JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+
+    /* Escaped backslash followed by literal u0000 is not a null escape. */
+    const char *data = "{\"a\": \"\\\\u0000\"}";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+
+    /* Truncated \u escapes do not read past NUL. */
+    assert_strict_refused("\"\\u", JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END);
+    assert_strict_refused("\"\\u00", JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END);
+
+    /* Lenient JsonParse() still accepts unquoted keys. */
+    data = "{plain: true}";
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+}
+
+static void test_parse_strict_large_object_linear(void)
+{
+    /* 10,000 unique keys: exercises O(n) hash-set duplicate tracking and
+     * direct append without O(n^2) rescans. */
+    const size_t n = 10000;
+    Writer *w = StringWriter();
+    WriterWriteChar(w, '{');
+    for (size_t i = 0; i < n; i++)
+    {
+        if (i > 0)
+        {
+            WriterWriteChar(w, ',');
+        }
+        WriterWriteF(w, "\"k%zu\":%zu", i, i);
+    }
+    WriterWriteChar(w, '}');
+    char *doc = StringWriterClose(w);
+
+    const char *data = doc;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    assert_int_equal(n, JsonLength(json));
+    JsonDestroy(json);
+    free(doc);
+
+    /* Duplicate at the tail of a large object is still refused. */
+    w = StringWriter();
+    WriterWriteChar(w, '{');
+    for (size_t i = 0; i < n; i++)
+    {
+        WriterWriteF(w, "\"k%zu\":%zu,", i, i);
+    }
+    WriterWrite(w, "\"k0\":0}");
+    doc = StringWriterClose(w);
+
+    data = doc;
+    json = NULL;
+    assert_int_equal(
+        JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY, JsonParseStrict(&data, &json));
+    assert_true(json == NULL);
+    free(doc);
+}
+
+static void test_parse_strict_max_depth(void)
+{
+    /* 128 nested arrays succeed; 129 exceed the cap. */
+    const size_t max_depth = 128;
+    Writer *w = StringWriter();
+    for (size_t i = 0; i < max_depth; i++)
+    {
+        WriterWriteChar(w, '[');
+    }
+    for (size_t i = 0; i < max_depth; i++)
+    {
+        WriterWriteChar(w, ']');
+    }
+    char *ok_arr = StringWriterClose(w);
+
+    const char *data = ok_arr;
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+    free(ok_arr);
+
+    w = StringWriter();
+    for (size_t i = 0; i < max_depth + 1; i++)
+    {
+        WriterWriteChar(w, '[');
+    }
+    for (size_t i = 0; i < max_depth + 1; i++)
+    {
+        WriterWriteChar(w, ']');
+    }
+    char *too_deep_arr = StringWriterClose(w);
+    assert_strict_refused(too_deep_arr, JSON_PARSE_ERROR_MAX_DEPTH);
+    free(too_deep_arr);
+
+    /* Same boundary for nested objects. */
+    w = StringWriter();
+    for (size_t i = 0; i < max_depth; i++)
+    {
+        WriterWrite(w, i + 1 < max_depth ? "{\"a\":" : "{}");
+    }
+    for (size_t i = 1; i < max_depth; i++)
+    {
+        WriterWriteChar(w, '}');
+    }
+    char *ok_obj = StringWriterClose(w);
+
+    data = ok_obj;
+    json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParseStrict(&data, &json));
+    assert_true(json != NULL);
+    JsonDestroy(json);
+    free(ok_obj);
+
+    w = StringWriter();
+    for (size_t i = 0; i < max_depth + 1; i++)
+    {
+        WriterWrite(w, i < max_depth ? "{\"a\":" : "{}");
+    }
+    for (size_t i = 0; i < max_depth; i++)
+    {
+        WriterWriteChar(w, '}');
+    }
+    char *too_deep_obj = StringWriterClose(w);
+    assert_strict_refused(too_deep_obj, JSON_PARSE_ERROR_MAX_DEPTH);
+    free(too_deep_obj);
 }
 
 static void test_parse_strict_invalid_earlier_duplicate(void)
@@ -2097,6 +2251,16 @@ static void test_parse_strict_error_string(void)
         JsonParseErrorToString(JSON_PARSE_ERROR_OBJECT_DUPLICATE_KEY);
     assert_true(message != NULL);
     assert_true(strstr(message, "duplicate") != NULL);
+
+    const char *const nul_msg =
+        JsonParseErrorToString(JSON_PARSE_ERROR_STRING_NULL_ESCAPE);
+    assert_true(nul_msg != NULL);
+    assert_true(strstr(nul_msg, "null") != NULL);
+
+    const char *const depth_msg =
+        JsonParseErrorToString(JSON_PARSE_ERROR_MAX_DEPTH);
+    assert_true(depth_msg != NULL);
+    assert_true(strstr(depth_msg, "depth") != NULL);
 }
 
 static void write_strict_test_file(
@@ -3252,12 +3416,52 @@ static void test_real_created_in_memory_renders_as_stored(void)
     JsonDestroy(json);
 }
 
+static void test_parse_string_trailing_backslash(void)
+{
+    /* Exact-sized heap buffers so ASan catches any read past the NUL. */
+    const char *const cases[] = {
+        "\"x\\",
+        "\"\\",
+        "{\"a\": \"x\\",
+        "{\"x\\",
+        "[\"x\\",
+        NULL
+    };
+
+    for (size_t i = 0; cases[i] != NULL; i++)
+    {
+        const size_t len = strlen(cases[i]);
+        char *buf = xmalloc(len + 1);
+        memcpy(buf, cases[i], len + 1);
+
+        const char *data = buf;
+        JsonElement *json = NULL;
+        assert_int_equal(
+            JSON_PARSE_ERROR_STRING_NO_DOUBLEQUOTE_END,
+            JsonParse(&data, &json));
+        assert_true(json == NULL);
+
+        free(buf);
+    }
+
+    /* Escaped trailing backslash before the closing quote still parses. */
+    const char *valid = "\"x\\\\\"";
+    JsonElement *json = NULL;
+    assert_int_equal(JSON_PARSE_OK, JsonParse(&valid, &json));
+    assert_true(json != NULL);
+    assert_string_equal("x\\", JsonPrimitiveGetAsString(json));
+    JsonDestroy(json);
+}
+
 int main()
 {
     PRINT_TEST_BANNER();
     const UnitTest tests[] = {
         unit_test(test_parse_strict_valid),
         unit_test(test_parse_strict_duplicate_member),
+        unit_test(test_parse_strict_non_json_forms),
+        unit_test(test_parse_strict_large_object_linear),
+        unit_test(test_parse_strict_max_depth),
         unit_test(test_parse_strict_invalid_earlier_duplicate),
         unit_test(test_parse_strict_repeated_section),
         unit_test(test_parse_strict_trailing_characters),
@@ -3341,6 +3545,7 @@ int main()
         unit_test(test_compare_container_type_mismatch),
         unit_test(test_json_get_type_as_string),
         unit_test(test_json_parse_object_missing_comma),
+        unit_test(test_parse_string_trailing_backslash),
         unit_test(test_real_renders_as_parsed),
         unit_test(test_real_created_in_memory_renders_as_stored),
 
